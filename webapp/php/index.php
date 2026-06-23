@@ -413,6 +413,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             exit;
         }
         // 見つからなければ Slim 経路へ（404 応答を共通化）
+    } elseif ($fast_path === '/posts') {
+        // GET /posts ページング。※Slim経路は 'me' を渡さない＝ヘッダは常にログインリンク。$me を定義しないことで一致。
+        $helper = $container->get('helper');
+        $max_created_at = $_GET['max_created_at'] ?? null;
+        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40');
+        $ps->execute([$max_created_at === null ? null : $max_created_at]);
+        $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
+        $post_list_html = build_list_html($helper, $rows);
+        $view = 'posts.php';
+        require __DIR__ . '/views/layout.php';
+        exit;
     }
 }
 

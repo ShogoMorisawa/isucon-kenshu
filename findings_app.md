@@ -134,3 +134,68 @@
 6. テンプレ/OPcache（⑥）: 確認のみ。
 
 総括: 画像をnginxへ逃がした今、残るPHP律速は「login時のopenssl fork」と「GET /のDB往復40回」。①③が次の二大ターゲット。CPUプロファイル(infra係)でlogin時のopensslプロセスとmake_postsのDB待ちが上位に出るはず。要 findings_infra.md と突き合わせ。
+
+---
+
+# 第3ラウンド調査（現在 ~170,000 / 目標 400,000・他チーム到達済）
+
+前提確認(適用済): 画像ファイル化+nginx直配信、index4本、fpm static16、make_postsのN+1一括化(comments IN 1本+preload_users IN)、PDO persistent、digest native、imgdata DB保存停止+FORCE INDEX。
+→ もう「軽いN+1潰し」では2倍は出ない。**リクエスト数そのものを減らす(キャッシュ)／1リクエストの固定費(session+DB往復+framework)を削る**の2方向で攻める。
+
+## 律速の再特定（どこを叩くべきか）
+ベンチのリクエスト内訳は概ね「GET /image(1ページ20枚) >> GET / ≈ GET /posts(もっと見る) > GET /posts/{id} > POST /comment,POST / > login系」。
+- 画像はnginx静的配信済 → **画像はクライアントキャッシュに載せて再取得を消すのが最大の物量削減**（下記③）。
+- 動的ページ(GET / 等)は今や1リクエストで「session_start(memcached往復) + get_session_user(DB) + posts(DB) + comments IN(DB) + users IN(DB) + Slim/PSR-7 + テンプレ描画」。**固定費が高い**。ここを削る（①②④）。
+
+## [13:2x 第3R-①] get_session_user が全動的リクエストで毎回 `SELECT *`／セッションにユーザを載せて消す（低リスク・全ホットパス）
+(1)現象: `get_session_user`(index.php:122-130)が GET /・/posts・/posts/{id}・comment・post 等**すべての動的リクエストで** `SELECT * FROM users WHERE id=?` を1往復実行（passhash等の不要列込み）。ログインユーザのなりすまし行で必ず走る。
+(2)原因仮説: 最ホットパスに毎回1 DB往復＋不要列転送が固定で乗る。RPSが上がるほど積算。
+(3)推奨アクション: **ログイン時(`POST /login`,`POST /register`)に `$_SESSION['user']` へ `id,account_name,authority` を丸ごと格納**し、`get_session_user` はDBを引かずセッションの値を返すだけにする。del_flg/authority変更は admin/banned のみ＝低頻度。banされたユーザの即時反映が要るならその経路だけ `del_flg` を確認、もしくは ban時にmemcachedのそのユーザ無効化フラグを立てる。
+(4)根拠: 全動的リクエストからDB1往復を除去。GET /・/posts のもっとも数が出る経路に効く。リスクは低（書込み経路が限定的）。MEMO「次の候補(App提案⑤)」の上位互換。
+
+## [13:2x 第3R-②] GET / と GET /posts のフィード結果を memcached キャッシュ（本命の大技・要厳密invalidate）
+(1)現象: GET / は毎回 posts/comments/users を引き、make_posts→テンプレで20件分を組み立て直す。フィード内容(最新20投稿＋各最新3コメント＋件数)は**全ユーザ共通**で、変化するのは投稿/コメントが入った時だけ。ヘッダの `me` 部分だけがユーザ別(header.php)。
+(2)原因仮説: 読み取り回数 >> 書き込み回数。同一フィードを毎回DBから再構築するのが純粋な無駄。
+(3)推奨アクション:
+  - make_posts が返す `$posts` 配列（または posts.php をレンダリングしたHTML断片）を memcached にキャッシュ。`me`/csrf はキャッシュ外でテンプレ合成（header.phpは別描画）。
+  - **invalidate設計（必須・ベンチの整合チェック対策）**: グローバルな「feedバージョン」整数を memcached に置き、`POST /`（新規投稿）と `POST /comment`（コメント投稿）で必ずインクリメント。読み取りは現バージョンをキー(`feed:v{N}:p{max_created_at}`)に使う。これで投稿/コメント直後の GET は確実に最新を返す（古いキーは参照されず期限切れ）。
+  - GET /posts/{id} も `post:{id}:v{M}` でキャッシュし、その post への comment 投稿時のみ M をbump（または該当キー削除）。
+  - 単一アプリサーバ＋共有memcachedなので整合は取りやすい。
+(4)根拠: 最ホットの読み取り経路から DB往復3〜4本＋make_posts計算＋（断片キャッシュなら）テンプレ描画を丸ごと除去。読み多write少の典型でキャッシュ効果大。**ただしベンチは「投稿/コメントが直後に見える」ことを検査する**ため、invalidateが甘いと fail 直行。まず②は GET /posts/{id} だけ等、影響範囲の小さい所から段階導入し、ベンチで整合(fail0)を確認しつつ広げるのが安全。
+
+## [13:2x 第3R-③] 画像の Cache-Control を immutable + 長期max-ageへ（物量を根本から削る・infra連携）
+(1)現象: nginx静的locationは現在 `expires 1d; Cache-Control "public"`(MEMO⑤)。画像URLは `/image/{id}.{ext}` で**id採番＝内容不変(immutable)**。
+(2)原因仮説: `1d`でもベンチ実行中(数分)はクライアントキャッシュに載るが、`public`のみだと条件付きGET(If-Modified-Since)で 304 往復が発生しうる。304でもnginx→OSのstatとネットワーク往復は消えない。
+(3)推奨アクション: 画像location を `add_header Cache-Control "public, max-age=31536000, immutable";` に。`immutable` でブラウザ/ベンチHTTPクライアントは**再検証すら行わず**ローカルキャッシュを使う→同一画像の再GET(304含む)が消滅。最ページ閲覧で1ページ20枚のうち既見分の往復がゼロに。（設定実体は infra係 isucon.conf 担当。app観点としてURL不変性ゆえ安全と保証できる）
+(4)根拠: 画像はリクエスト物量の最大要素。再取得・304往復を消すとnginx/ネットワークの負荷が大きく下がり、空いたCPU/帯域が動的処理に回る。private-isu高得点帯の定石。要 findings_infra.md と調整。
+
+## [13:2x 第3R-④] Slim/PSR-7 + PhpRenderer の固定オーバーヘッド（CPU律速の本丸・中〜大工事）
+(1)現象: 全動的リクエストで Slim のルーティング、PSR-7 Request/Response 生成、無名クラスView生成、layout.php→header→viewの多段 `require` が走る。1枚あたりは小さいが高RPSで積算し、170k帯では**PHP-FPMのCPUがこの固定費で食われている**可能性が高い。
+(2)原因仮説: DBを削り切った後の動的ページの残コストはフレームワーク/テンプレ実行が主。
+(3)推奨アクション（効果見込み順・工数大）:
+  - **OPcache が default On（MEMO仕上げ7）であることは前提。** JITは効果無しと判定済なのでOFFのままで良い。
+  - 最ホットの GET / は②のフラグメント/全文キャッシュで「テンプレ実行自体を回避」するのが一番効く（②と統合）。
+  - 余力があれば GET /image 以外でも、本当に重い経路のみ Slim を介さない薄い処理に切り出す（大工事のため②③の後）。
+(4)根拠: CPUプロファイル(infra係)で php-fpm の self時間がフレームワーク/テンプレ関数に集中していれば本項が当たり。②のキャッシュで大半が回避できるため、独立施策としての優先度は②の後。
+
+## [13:2x 第3R-⑤] GET / と /posts の `LIMIT 100` を縮小（軽微・即効）
+(1)現象: del_flg除外のため母数100行を取得し make_posts で20件に絞る(index.php:357,373)。削除ユーザは id%50==0 ＝約2%なので、20件表示に必要なのは概ね21件、最悪でも余裕をみて~40件。
+(2)原因仮説: 100行→実質20行で、80行ぶんの行転送・PHP配列構築が無駄。
+(3)推奨アクション: `LIMIT 100`→`LIMIT 40` 程度へ縮小（FORCE INDEX idx_created_at はそのまま）。ベンチで20件揃うこと(fail0)を確認。
+(4)根拠: 行転送/メモリ/ループを~2.5倍削減。軽微だが無リスクに近い即効。
+
+## [13:2x 第3R-⑥] /@{account_name} の冗長クエリ（低traffic・DB係提案と重複）
+(1)現象: posts WHERE user_id を **2回**実行(index.php:563 make_posts用 と 570 post_ids用)。さらに comment_count と commented_count を別COUNTで取得。
+(2)原因仮説: L563の結果から id を array_column すれば L570 は不要。
+(3)推奨アクション: L563取得結果を流用し L570-572 を削除。post_count はその件数。（MEMO「次の候補(DB提案③)」と同一。低traffic経路なので優先度は②③より下）
+(4)根拠: 1リクエストあたりpostsクエリ1本削減。ユーザページは数が出ないため効果は限定的。
+
+## [13:2x 第3R] 40万点への戦略まとめ（実装係向け・効果/リスク順）
+1. **③ 画像 Cache-Control immutable+長期**（最大物量削減・低リスク・infra連携）: まず入れる。
+2. **① get_session_user をセッション格納で消す**（全動的経路から1 DB往復除去・低リスク）。
+3. **② memcached フィード/詳細キャッシュ**（最ホット読み取りをDB+描画ごと回避・**高効果だが要厳密invalidate**）: /posts/{id}など小範囲から段階導入しfail0確認しつつ拡大。
+4. **④ フレームワーク/テンプレ固定費削減**: 大半は②で回避。残りはプロファイル次第。
+5. **⑤ LIMIT 100→40**（無リスク即効・小）。
+6. **⑥ /@user の冗長posts query削除**（小）。
+
+40万点チームの大技推測: (a)画像をimmutable長期キャッシュ＋nginx sendfileで再取得を消し物量を激減、(b)read-heavyなトップ/詳細をmemcachedキャッシュしDB・PHP描画を回避、(c)php-fpm worker数をCPUコアに最適化しnginx/mysqlとCPUを取り合わない配分、の組合せが濃厚。アプリ側で効くのは(a)(b)＝本ラウンドの③②。要 findings_db.md / findings_infra.md と突き合わせ（特に③のnginx設定と④のCPUプロファイル）。

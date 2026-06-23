@@ -105,6 +105,14 @@ cd /home/isucon/private_isu/benchmarker
 ## 📥 調査係からの提案 採否
 - findings_db.md / findings_app.md / findings_infra.md を参照し、採用したものをここに記録
 
+## 🔬 CPU実測（第3R step0, 2026-06-23 13:09, ベンチRUNNING中 mpstat/pidstat）
+- **2コアCPUは完全飽和: %idle ≈ 0.06%**（usr~76% + sys~21%）。CPUが唯一の壁。CPU節約=即スループット増。
+- プロセス別CPU（1コア=100%換算, 合計上限200%）:
+  - **php-fpm8.3 = 69%（サーバ側で最大消費）** / mysqld = 39% / nginx = 23%
+  - **benchmarker = 60%（同一2コアを専有！）** ← HTMLのgzipをnginxが圧縮＋benchが解凍で二重浪費の裏付け
+- 判定: php-fpm支配的＝**app主導**（キャッシュ/描画削減/DB往復削減が本丸）。加えてbench60%から**HTML gzip無効化(step3)も有効見込み**。mysqld39%はstep1/5のDB往復削減で軽減可。
+- → 方針確定: step1(session) → step2(画像cache) → step3(gzip/worker A/B) → step4(feedキャッシュ本命)。
+
 ## 📌 環境メモ（判明した事実を実装係が追記）
 - 稼働中スタック: nginx → php8.3-fpm(127.0.0.1:9000) → MySQL(3306) + memcached(11211, セッション用)。
 - PHPアプリ: `/home/isucon/private_isu/webapp/php/index.php`（Slim, 1枚構成）。views/ vendor/ あり。

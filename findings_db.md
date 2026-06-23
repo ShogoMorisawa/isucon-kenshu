@@ -78,3 +78,68 @@ ALTER TABLE posts    ADD INDEX idx_user_created (user_id, created_at);  -- ③
 ALTER TABLE comments ADD INDEX idx_user_id (user_id);                  -- ③
 ```
 適用後は再EXPLAINで type が ref/range に変わり filesort が消えることを確認したい（IDLE時に再計測する）。
+
+---
+---
+
+# 第2ラウンド調査（score 81,758 時点 / 2026-06-23 / 信号機IDLE時計測）
+
+## 総括（DB調査係の見立て）
+**DBはもはや律速ではない。** 前回提案のindex4本＋アプリ最適化が効き、ホットクエリは全て
+index でカバーされ、全件スキャン(type:ALL)・filesort は消滅した。再EXPLAIN結果：
+
+| クエリ(行) | type | key | rows | Extra |
+|---|---|---|---|---|
+| L144 per-post COUNT comments | ref | idx_post_created | 8 | **Using index(covering)** |
+| L145 comments LIMIT3 | ref | idx_post_created | 8 | Backward index scan |
+| L314 index page posts LIMIT100 | index | idx_created_at | 100 | Backward index scan |
+| L519 account posts WHERE user_id | ref | idx_user_created | 12 | Backward index scan |
+| L534 account comments IN(...) | range | idx_post_created | 48 | Using where; Using index |
+
+→ どれも数〜100行アクセスで完結。**残る律速はアプリ(PHP-CPU)とインフラ(php-fpm worker/2コアCPU)へ移った**
+と判断する。DB側の伸びしろは「クエリ高速化」ではなく「ラウンドトリップ削減」と「運用安全性」が中心。
+
+## [12:1x] ① imgdata が依然DBに保存され続けている【スコアより運用リスク・要注意】
+- (1)現象: posts.data_length = **1,204MB**（avg 127KB/行, 10,133行で増加中）。`POST /`(L390) が
+  `INSERT INTO posts (...imgdata...)` で毎回blobをDBにも書く。ベンチ毎にDB+ファイル両方が増える。
+- (2)原因仮説/影響: **クエリ速度への悪影響はほぼ無い**（一覧/詳細はimgdataを引かないカラム限定済み、
+  mediumblobはoff-page格納でclustered indexスキャンは20byteポインタしか読まないため）。
+  問題は (a)**ディスク逼迫**（MEMOに残~1GB/94%。ベンチ毎に増えると枯渇しfail化リスク）、
+  (b)buffer_pool 512MB に対しテーブル1.2GBで二重持ちの無駄。
+- (3)推奨アクション: `POST /`(L390) の INSERT から imgdata を外し、ファイル書き出しのみにする。
+  ただし `GET /image/{id}`(L417) のフォールバックが `SELECT mime,imgdata` 依存。
+  → 投稿時に必ずファイルを書く(MEMO①で実装済)前提なら、imgdataカラムを `''` で挿入 or NOT NULL外す等の設計が必要。
+  既存blobは消さずとも新規分を止めるだけでディスク増加は鈍化。**安全側に倒し、まずINSERTから外すのを推奨**。
+- (4)根拠: data_length 1,204MB の99%超がimgdata。クエリ実害は無いがディスク94%は次のfail要因になり得る。
+
+## [12:1x] ② comment_count の per-post COUNT を GROUP BY 一括化（ラウンドトリップ削減）
+- (1)現象: make_posts(L144) が1ページ表示で投稿20件×`SELECT COUNT(*) ... WHERE post_id=?` を発行（N+1）。
+  個々は covering index で <1ms だが、PHP↔MySQL のラウンドトリップが20回/ページ。L145のLIMIT3も同様に20回。
+- (2)原因仮説: 1件ずつ問い合わせる実装。クエリ単体は速いが回数が多くRTT/PHPオーバーヘッドが累積。
+- (3)推奨アクション（アプリ係と連携／DB観点の提案）:
+  COUNT をまとめる →
+  `SELECT post_id, COUNT(*) AS c FROM comments WHERE post_id IN (?,...) GROUP BY post_id;`（1発）。
+  EXPLAINでは idx_post_created の range + Using index で完結見込み。20回→1回に削減。
+  ※さらに踏み込むなら posts に `comment_count` 集計列を持たせ comment INSERT 時に更新（COUNT自体を消す）。
+- (4)根拠: クエリ高速化効果は小さいが、トップページは最頻アクセスで20→1のRTT削減はPHP-CPU/レイテンシに効く可能性。
+  **効果は中程度・①より低リスク。アプリ係の改修コストと相談。**
+
+## [12:1x] ③ getAccountName が posts WHERE user_id を2回投げている（重複クエリ）
+- (1)現象: `/@{account_name}` で L519(全カラム取得) と L526(`SELECT id` のみ) が同じ
+  `posts WHERE user_id=?` を2回実行。L526はpost_ids収集→L534のIN用。
+- (2)原因仮説: post_count と post_ids を別途取得しているが、L519/L521 の $results から `array_column($results,'id')` で流用可能。
+- (3)推奨アクション（アプリ係連携）: L526 のクエリを削除し L519 の結果を再利用。クエリ1本削減。
+- (4)根拠: 両クエリともindex効くが、/@user での冗長な往復。低コストで1本削減。
+
+## [12:1x] ④ スロークエリログは依然OFF（計測の所感）
+- (1)現象: slow_query_log=OFF のまま。innodb_buffer_pool_size=512M は適用確認済。
+- (2)所感: 現時点で long_query_time=0 にしてもDB側に重いクエリはほぼ出ないはず（全indexカバー済）。
+  律速がアプリ/インフラに移った裏付けとして、**ベンチ中の `SHOW PROCESSLIST` でもDBがidle寄りなら確定**。
+  逆に計測したい場合のみ一時的に slow_query_log=ON / long_query_time=0 で digest を取る程度でよい。
+- (3)推奨: DB側の追加チューニングより、アプリ(digest/openssl→hashネイティブ化, レンダリング)とinfra(php-fpm/CPU)を優先すべき。
+
+## 第2ラウンドまとめ（実装係向け・優先度順）
+1. **①imgdata の INSERT 停止**（スコアより先にディスク枯渇リスク回避。要 /image フォールバック設計）
+2. **②comment_count を GROUP BY 一括 or 集計列化**（最頻ページのRTT 20→1。アプリ係と協働）
+3. ③getAccountName の重複 posts クエリ削除（低コスト）
+- **新規index追加は不要**。DBクエリは出尽くしており、次の伸びはアプリ/インフラ側。

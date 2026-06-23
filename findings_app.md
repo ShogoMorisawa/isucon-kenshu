@@ -66,3 +66,71 @@
 6. /admin/banned 一括UPDATE（余力があれば）
 
 ※インデックスは DB係担当だが、上記IN句/JOIN化は `comments(post_id)`、`posts(user_id)`、`posts(created_at)` 等のインデックス前提。DB係の findings_db.md と突き合わせ推奨。
+
+---
+
+# 第2ラウンド調査（532→81758 達成後の再分析）
+
+前提: ①画像ファイル化+nginx直配信 ②index4本 ③fpm/mysql調整 ④user取得メモ化+LIMIT100+SELECTカラム限定 ⑤nginx静的最適化 が適用済み。
+画像GETはnginx直配信となりPHPを通らない。よって現在PHPを通る主要負荷は GET /・GET /posts・GET /posts/{id}・POST /comment・POST /・login/register。
+見立て: 画像がPHPから外れた今、**PHP-FPMのCPU/DBラウンドトリップ**が律速。以下を効果順に。
+
+## [12:1x 第2R-①] digest() の openssl 外部プロセス起動が未対応（最優先・確証あり）
+(1)現象: `digest()`(index.php:205-209) が今も `printf ... | openssl dgst -sha512 | sed` をバッククォートで都度起動。login/register で `calculate_passhash`→`calculate_salt`+本体 で **1リクエストにつき最低2回**シェル+openssl+sedをfork/exec。
+(2)原因仮説: プロセス起動はミリ秒級でPHPネイティブhash(マイクロ秒級)の数百〜千倍。login負荷シナリオでCPUとプロセステーブルを圧迫し、ベンチ初期にlogin/register/logoutのタイムアウトを出していた根本要因がここ。
+(3)推奨アクション: `digest($src)` を `return hash('sha512', $src);` に置換するだけ。**出力は完全互換を実測確認済**（下記根拠）。escapeshellarg/printf/sed すべて不要になる。
+(4)根拠: 実測で `printf "%s" "test:salt" | openssl dgst -sha512 | sed 's/^.*= //'` と `hash('sha512','test:salt')` がバイト一致（ccfba6...cf36）。よって既存passhashと完全互換でリスクほぼ無し。1回あたり数ms→数µsへ。login多シナリオで大きな余地。
+
+## [12:1x 第2R-②] PDO接続がリクエスト毎に新規（persistent化の余地）
+(1)現象: `$container->set('db', ...)` (index.php:53-60) が毎リクエスト `new PDO(...)` を生成。PDOオプション未指定で persistent でない。
+(2)原因仮説: GET / 等のたびにMySQLへ新規接続(TCP+認証ハンドシェイク)。高RPS下では接続確立/破棄のコストとMySQL側のスレッド生成が無視できない。
+(3)推奨アクション: PDOコンストラクタ第4引数に `[PDO::ATTR_PERSISTENT => true]` を付与し接続を再利用。pm=static/max_children=16なので常駐接続は最大16前後、MySQL `max_connections` に収まる範囲で安全。併せて `PDO::ATTR_EMULATE_PREPARES => true`(既定) はラウンドトリップ削減になり現状維持で良い。
+(4)根拠: fpmワーカー16が高頻度で接続を張り直すと、接続コスト×RPSが積み上がる。persistentで接続ハンドシェイクをほぼ消去。
+
+## [12:1x 第2R-③] make_posts の comment_count / comments がまだ投稿数ぶんN+1
+(1)現象: `make_posts`(index.php:144-152) は user取得こそメモ化されたが、投稿1件ごとに
+  - `SELECT COUNT(*) FROM comments WHERE post_id=?`（1本/投稿）
+  - `SELECT * FROM comments WHERE post_id=? ORDER BY created_at DESC [LIMIT 3]`（1本/投稿）
+を発行。GET / は20件表示で約20+20=**40往復/リクエスト**（最ホットエンドポイント）。
+(2)原因仮説: indexで各クエリは速いが、往復回数×RPSでPHP↔MySQLのsyscall/レイテンシが積算。GET / の主コスト。
+(3)推奨アクション（いずれか）:
+  - 案A(最小): 表示対象の post_id を集め、`SELECT post_id, COUNT(*) ... WHERE post_id IN (...) GROUP BY post_id` で件数一括、`SELECT * FROM comments WHERE post_id IN (...) ORDER BY post_id, created_at DESC` でコメント一括取得→PHPでpost_idごとに振り分け＆上位3件。40往復→2往復。
+  - 案B(本命): `posts` に `comment_count` 集計列を追加し、`POST /comment` のINSERT時に `UPDATE posts SET comment_count=comment_count+1` 。COUNT(*)自体を消す（DB係と要相談）。
+  - ※`SELECT *` のコメント取得も `id,post_id,user_id,comment,created_at` 等に限定推奨（commentにBLOBは無いが習慣として）。
+(4)根拠: GET / 1回で40→2往復は約95%削減。最ホットパスなのでスコア寄与大の可能性。indexは idx_post_created 済で IN+GROUP BY も効く。
+
+## [12:1x 第2R-④] POST / で imgdata を依然DBへ書込み＋tmpファイルを3回読み
+(1)現象: `POST /`(index.php:384,395,403) が `file_get_contents($_FILES['file']['tmp_name'])` を**3回**実行（サイズ検査・INSERT・ファイル書出し）。さらに `INSERT INTO posts (...imgdata...)` でBLOBをDBにも保存し続けている。
+(2)原因仮説: 最大10MBのアップロードを3回ディスクから読み直し。かつDBにもBLOBを二重保存しDBサイズ/書込みI/Oを増やす。MEMOの「ディスク残~1GB(94%)」逼迫の主因。投稿頻度は低いが、ディスク枯渇は500/破損リスク直結。
+(3)推奨アクション:
+  - tmp内容を `$data = file_get_contents(...)` で1回だけ読み、以降は変数を使い回す。
+  - imgdata の DB保存を廃止しファイルのみに（INSERTから imgdata 列を外す）。ただし `GET /image` フォールバックがDB依存(index.php:417,424)のため、廃止する場合は **POST時に必ずファイル書出し成功を保証**し、フォールバックも「ファイル優先・無ければ404 or 再生成不可」へ設計変更が必要。安全策として当面は「DB保存は残しつつ tmp読みを1回化」だけ先行でも可。
+(4)根拠: 10MB×3読み→1読み。DB BLOB廃止でディスク逼迫(94%)を緩和。投稿頻度低いためスコア直効果は中だが、ディスク枯渇による崩壊リスク回避の意味が大きい。
+
+## [12:1x 第2R-⑤] get_session_user が毎リクエストで users をSELECT
+(1)現象: `get_session_user`(index.php:120-128) はログイン中の全リクエストで `SELECT * FROM users WHERE id=?` を実行。GET /・/posts・/posts/{id}・comment 等すべてで1往復。
+(2)原因仮説: PK1行引きで軽量だが最ホットパスに毎回1往復が乗る。`SELECT *` で不要列(passhash等)も取得。
+(3)推奨アクション: 最低限 `SELECT id, account_name, authority, del_flg` にカラム限定。さらにセッションに user スナップショットを持たせ毎回のSELECTを省く案もあるが、del_flg/authority変更(admin/banned)が即時反映されない副作用に注意。まずはカラム限定が安全。
+(4)根拠: passhash等の不要列除外で行サイズ減。効果は中の下だが全ホットパスに効く。
+
+## [12:1x 第2R-⑥] テンプレートレンダリングは現状ボトルネックではない（参考）
+(1)現象: layout.php→各view、posts.php が投稿をforeachし post.php を `require`。escape_html(htmlspecialchars)を各フィールドで実行。
+(2)原因仮説: 1ページ20投稿程度では描画コストはDB往復に比べ十分小さい。OPcacheが効いていれば実行コストは低い。
+(3)推奨アクション: 当面手を入れる優先度は低い。OPcache有効化(infra係)が未なら確認推奨。優先は①〜④。
+(4)根拠: DB往復40回 vs PHP描画。律速は前者。
+
+## [12:1x 第2R-⑦] initialize 時の画像書き出しの妥当性（再投入耐性の確認）
+(1)現象: `GET /initialize`(index.php:222-225) は `db_initialize()` で posts id>10000 / comments id>100000 / users id>1000 をDELETEし del_flg を再設定するのみ。画像ファイルの再生成・掃除は**していない**。既存画像は別途 `export_images.php` で全件書出し済（MEMO ①）。
+(2)原因仮説: ベンチが投稿した id>10000 の画像ファイルは public/image に残り続け、DBからはDELETEされる→**ファイルとDBの不整合(ゴミファイル累積)**。`GET /image` フォールバックがDB前提のため、DB削除済みidのファイルが残っても実害は少ないが、ディスクを食う。再投入(initialize連打)でファイルが単調増加。
+(3)推奨アクション: initialize時に `public/image` の id>10000 のファイルを掃除する処理を追加すると、ディスク逼迫(94%)とゴミ蓄積を防げる。ただしベンチのinitializeはタイムアウトがあるため重い全削除は避け、`find public/image -name 'glob' ...` 相当を軽量に。実害が出るまでは優先度中。
+(4)根拠: ディスク残~1GB(94%)。ベンチ毎に id>10000 画像が累積。掃除しないと数回のベンチで枯渇しうる。
+
+## [12:1x 第2R] 律速の見立てまとめ（実装係向け・効果順）
+1. **digest()→hash('sha512')**（①）: 確証あり・互換実測済・低リスク・login負荷で大。まず即やる。
+2. **PDO persistent接続**（②）: 全ホットパスの接続コストを削減。低リスク。
+3. **make_posts の comment_count/comments を IN一括 or 集計列**（③）: GET / の40往復→2往復、最ホットパスで寄与大。
+4. **POST / の tmp1回読み＋imgdata DB保存見直し**（④）＋**initialize画像掃除**（⑦）: ディスク逼迫(94%)対策。崩壊リスク回避。
+5. get_session_user カラム限定（⑤）: 中の下。
+6. テンプレ/OPcache（⑥）: 確認のみ。
+
+総括: 画像をnginxへ逃がした今、残るPHP律速は「login時のopenssl fork」と「GET /のDB往復40回」。①③が次の二大ターゲット。CPUプロファイル(infra係)でlogin時のopensslプロセスとmake_postsのDB待ちが上位に出るはず。要 findings_infra.md と突き合わせ。

@@ -13,6 +13,7 @@
 | 2026-06-23 12:01 | **40135** (pass, success37072/fail0) | ④make_postsのユーザ取得をリクエスト内メモ化、/ と /posts を `ORDER BY created_at DESC LIMIT 100`(idx_created_at逆順読み・filesort無)で母数9000→100に削減、/posts/{id}の`SELECT *`をカラム限定(imgdata除外)。29574→40135(+36%)。採用。※JOIN+del_flg版はfilesort誘発で不採用 |
 | 2026-06-23 12:05 | 30304 (**fail167**, 500/静的不一致) | ⑤nginx最適化 第1版。`open_file_cache max=10000` に対し fd上限が低く `Too many open files`→500・画像破損。→nginx設定そのままで fd上限引き上げを追加投入 |
 | 2026-06-23 12:08 | **81758** (pass, success78939/**fail0**) | ⑤+fd上限修正。`worker_rlimit_nofile 65535`, `worker_connections 8192`, `multi_accept on`。gzip_types/keepalive65/open_file_cache/静的にexpires1d+Cache-Control public。40135→81758(+104%)。採用 |
+| 2026-06-23 12:2x | **79041** (pass, success76121/fail0) | 【保全1】MySQL binlog無効化(`disable-log-bin`)+`RESET MASTER`で1.8GB解放(96%→84%)、`innodb_flush_log_at_trx_commit=2`。スコアは81758比-3%だが変動幅内。ディスク危機回避が主目的。採用 |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。
@@ -27,6 +28,10 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 12:2x 【保全1】MySQL binlog無効化＋fsync緩和。disk 681MB→2.5GB解放(96%→84%)。
+  - `mysqld.cnf` に `disable-log-bin` / `innodb_flush_log_at_trx_commit = 2`。bak: mysqld.cnf.bak2
+  - 既存binlog(21ファイル1.8GB)は `RESET MASTER` で purge 済（restart前に実行）。
+  - 要 `systemctl restart mysql`。レプリ不要なベンチ用途のため安全。
 - 2026-06-23 12:08 ⑤nginx静的最適化（/etc/nginx/nginx.conf + sites-available/isucon.conf）。score 40135→81758。
   - nginx.conf: `worker_rlimit_nofile 65535`, events `worker_connections 8192; multi_accept on;`,
     `keepalive_timeout 65`, `open_file_cache max=10000 inactive=60s`(+valid/min_uses/errors),
@@ -59,6 +64,7 @@ cd /home/isucon/private_isu/benchmarker
 
 ## 🔧 いま作業中（実装係が宣言）
 - なし（①〜⑤完了。532→81758, fail0）
+- 2026-06-23 12:1x git管理開始（初回コミット完了、スコア81758）。.gitignore で画像生成物/vendor/node_modules/.venv/userdata/bin/*.log/*.bak 等を除外し .git=1.2M。以降は各ステップのベンチ後に `git commit`（メッセージに施策名+スコア）運用。
 
 ## ⏭️ 次の候補（未着手・効果見込み順）
 - digest() の openssl 外部プロセス起動を PHP の hash('sha512') ネイティブ化（login多シナリオ／findings_app ⑤）。出力フォーマット互換に注意。

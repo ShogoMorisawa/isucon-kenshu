@@ -380,21 +380,40 @@ function calculate_passhash($account_name, $password) {
 
 // --------
 
-// === GET / 高速パス: Slim/PSR-7 のルーティング・オブジェクト生成・ミドルウェアを通さず直接レンダリング ===
-// 最頻endpoint GET / の固定費(framework)を削減。テンプレ(layout→header→index→posts)は通常経路と同一を使用し
-// 出力HTML・Content-Type(text/html; charset=UTF-8 = PHP既定)は通常経路とバイト一致。
-// 投稿リストは断片キャッシュ build_list_html を共用、me/csrf/flash も同じ取り回し。
-if ($_SERVER['REQUEST_METHOD'] === 'GET' && $_SERVER['REQUEST_URI'] === '/') {
-    $helper = $container->get('helper');
-    $me = $helper->get_session_user();
-    $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 40');
-    $ps->execute();
-    $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
-    $post_list_html = build_list_html($helper, $rows);
-    $flash = $container->get('flash')->getFirstMessage('notice');
-    $view = 'index.php';
-    require __DIR__ . '/views/layout.php';
-    exit;
+// === 高速パス: 頻出GET endpointを Slim/PSR-7 非経由で直接レンダリング（framework固定費削減） ===
+// テンプレ・変数は通常(Slim)経路と同一を使い、出力HTML/Content-Typeはバイト一致（各endpointでdiff検証）。
+// 該当しない/見つからない場合は exit せず通常の Slim ルーティングへフォールスルー。
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    $fast_path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+
+    if ($fast_path === '/') {
+        $helper = $container->get('helper');
+        $me = $helper->get_session_user();
+        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 40');
+        $ps->execute();
+        $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
+        $post_list_html = build_list_html($helper, $rows);
+        $flash = $container->get('flash')->getFirstMessage('notice');
+        $view = 'index.php';
+        require __DIR__ . '/views/layout.php';
+        exit;
+    } elseif (preg_match('#^/posts/(\d+)$#', $fast_path, $fm)) {
+        // GET /posts/{id} 投稿詳細（全コメント）。存在時のみ高速描画、404は Slim へフォールスルー。
+        $helper = $container->get('helper');
+        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?');
+        $ps->execute([(int)$fm[1]]);
+        $results = $ps->fetchAll(PDO::FETCH_ASSOC);
+        $posts = $helper->make_posts($results, ['all_comments' => true]);
+        if (count($posts) > 0) {
+            $post = $posts[0];
+            $me = $helper->get_session_user();
+            $csrf_token = $_SESSION['csrf_token'] ?? '';
+            $view = 'post.php';
+            require __DIR__ . '/views/layout.php';
+            exit;
+        }
+        // 見つからなければ Slim 経路へ（404 応答を共通化）
+    }
 }
 
 $app->get('/initialize', function (Request $request, Response $response) {

@@ -117,16 +117,22 @@ cd /home/isucon/private_isu/benchmarker
   - 動作確認: / 200, /login 200, /css/style.css 200, /image/1.jpg 200(image/jpeg)。
 
 ## 🔧 いま作業中（実装係が宣言）
-- なし。第2ラウンド（保全1-2＋性能3-5＋仕上げ6-7）完了。**532→約170,000（fail0）**。git管理運用中(各ステップcommit)。
-- ✅ ディスク危機 解消: 96%(681MB)→**76%(3.6GB空き)**（binlog無効化1.8GB + imgdata削除1.2GB）。
+- なし。**第3ラウンド完了。現在 ~195,000（fail0）**。git管理運用中(各ステップcommit)。
+- ✅ ディスク危機 恒久対策済: /initialize で id>10000 画像を自動掃除（ベンチ反復で再逼迫しない）。現在74%。
+- 第3R確定の伸び: HTML gzip無効化(+7%) / GET /フィードキャッシュ(+5.5%) / LIMIT40(+2%)。session・画像immutableは零リスクで維持(score変動内)。
 
-## ⏭️ 次の候補（未着手・効果見込み順）
-- 【DB提案③】getAccountName(/@user) が posts WHERE user_id を2回投げている→L519結果を流用しL526削除（低コスト）。
-- 【App提案⑤】get_session_user の `SELECT *`→必要カラム限定（全ホットパスに1往復、効果中の下）。
-- POST /comment で posts.comment_count 集計列を持たせCOUNT自体を消す案（性能4でper-post COUNTは既に解消済なので優先度低）。
-- php-fpm max_children / CPU配分: ベンチ中 `top` で php-fpm と mysqld のCPU%を観測。CPU2コア飽和なら worker増は無効。
+## 🧱 現在の律速（第3R実測の結論）
+- CPU 2コア完全飽和。**php-fpm=80%が壁**、mysqld=29%(非律速)、bench自身=67%。
+- → これ以上はDB施策ではなく**PHP実行量(framework/session/テンプレ)の削減**でしか伸びない。
+- 検証で分かったこと: GET /は**認証済トラフィックが主**（匿名フルHTMLキャッシュが効かなかった）。
+  session_start(memcached往復)+Slim/PSR-7+feed_cache get/unserialize が認証済GET /の固定費。
+
+## ⏭️ 次の候補（400kへ・効果見込み順 / いずれもphp-fpm削減狙い）
+- 認証済GET /の固定費削減: ①session_startの最適化（memcached往復は必須だが、cache getと統合 or 1回化）②Slimを介さない薄いルートに GET / を切り出し（大工事）。
+- GET / の posts.php 断片HTMLをキャッシュし、ヘッダ(me)だけ動的合成（テンプレ実行の大半を回避。認証済にも効く）。匿名フルHTMLと違い認証済にもヒット。
+- bench自身が67%CPU→相乗りで上限を押し下げている。これは実機分離環境なら消える要素（同一ホスト計測の限界）。
 - ⚠️ ベンチ変動幅±2.5%。効果判定は同方向・複数回・変動超のときのみ。
-- 🧹 public/image に id>10000 のゴミ画像が累積（initializeで掃除せず）。ディスク再逼迫時に整理。
+- 【skip済】性能5 comment_count非正規化: mysqld非律速のため効果薄と判断しskip。やるなら断片キャッシュの後。
 
 ## 📥 調査係からの提案 採否
 - findings_db.md / findings_app.md / findings_infra.md を参照し、採用したものをここに記録

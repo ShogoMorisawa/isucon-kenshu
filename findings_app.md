@@ -199,3 +199,62 @@
 6. **⑥ /@user の冗長posts query削除**（小）。
 
 40万点チームの大技推測: (a)画像をimmutable長期キャッシュ＋nginx sendfileで再取得を消し物量を激減、(b)read-heavyなトップ/詳細をmemcachedキャッシュしDB・PHP描画を回避、(c)php-fpm worker数をCPUコアに最適化しnginx/mysqlとCPUを取り合わない配分、の組合せが濃厚。アプリ側で効くのは(a)(b)＝本ラウンドの③②。要 findings_db.md / findings_infra.md と突き合わせ（特に③のnginx設定と④のCPUプロファイル）。
+
+---
+
+# 第4ラウンド調査（大会 369,640 / 出発292,146 → 目標 500,000）
+
+確認した適用済(大会実証): 断片HTMLキャッシュ(pf:{id}:c{count})、comment_count非正規化、遅延セッション、主要GET(/ /posts /posts/{id} /@user /image)のSlimバイパス高速パス。
+**律速は引き続き php-fpm CPU=80%（mysqld 29%は非律速）**。よって本ラウンドは一貫して「**1リクエストあたりのPHP実行命令数とブロッキング往復(DB/memcached)を削る**」に絞る。
+
+## 計測で判明した前提（今回 php -m / php -i で確認）
+- **APCu は未インストール**（`php8.3-apcu` は apt candidate 5.1.22 あり、入れれば使える）。現状リスト描画の断片は**memcached(TCP往復)** で getMulti している。
+- opcache: enable=On / memory=128M / max_accelerated_files=10000 / interned_strings_buffer=**8M(小)** / validate_timestamps=On(revalidate_freq=2) / JIT=off / **preload=未設定**。
+- igbinary 拡張あり（memcachedのシリアライザに使えるが、断片は文字列なので効果薄）。
+
+## [16:1x 第4R-①] 断片キャッシュを memcached → APCu(プロセス共有メモリ)へ（最有力・要拡張導入）
+(1)現象: `build_list_html`(index.php:287-357) は最ホットの GET / で毎回 `feed_cache()->getMulti(~21キー)` を実行。memcachedは127.0.0.1でもTCP(orunix socket)往復＝**php-fpmワーカーが同期ブロックする**。全リスト描画(/ /posts /@user)で発生。
+(2)原因仮説: 単一アプリサーバ構成なのに、プロセス内で完結できるキャッシュをネットワーク往復で取りに行っている。getMultiのシリアライズ/デシリアライズ＋ソケットI/Oが php-fpm CPU(80%律速)に乗る。
+(3)推奨アクション: `php8.3-apcu` を導入し、断片キャッシュを **APCu(`apcu_fetch`/`apcu_store`)** に置換。APCuはfpm worker間で共有されるmmapメモリで、getは数µs・ネットワーク往復ゼロ。キー体系(`pf:{id}:c{count}`)・TTL・自動invalidate(comment_count変化でキー変化)はそのまま流用可能。`/initialize` の flush は `apcu_clear_cache()` に。**単一サーバなので一貫性問題なし**。
+(4)根拠: 律速の php-fpm から「リスト描画ごとのmemcached往復(21キー分のI/O+デシリアライズ)」を丸ごと除去。最頻経路に効くため寄与大の見込み。導入は infra係（拡張install+`systemctl restart php8.3-fpm`）。※APCu不可なら次善として memcached を unix socket 化＋igbinaryシリアライザで往復コスト低減。
+
+## [16:1x 第4R-②] 高速パスを AppFactory::create() より前へ移動（Slim Appの生成を毎回スキップ・零リスク）
+(1)現象: 高速パスのバイパス分岐(index.php:386-477)は `AppFactory::setContainer()` + **`AppFactory::create()`**(234-235)の**後**に置かれている。GET / 等の高速パスは最後に `exit` するので `$app->get(...)` 登録(479-825)や `$app->run()` は走らないが、**`AppFactory::create()`（App本体・Router・MiddlewareDispatcher等の生成）は全リクエストで毎回実行されている**。
+(2)原因仮説: 高速パスの狙いは「Slimを通さない」ことだが、Slim Appオブジェクトの構築コスト自体は削れていない。最頻リクエストで無駄な生成が残存。
+(3)推奨アクション: バイパス分岐ブロックを `$container->set('helper',...)` 完了直後（234行 AppFactory手前）へ移動する。高速パスが使うのは `$container->get('helper')`/`get('flash')` のみで Slim App は不要。フォールスルー時のみ `AppFactory::setContainer/create()` 以降を実行する構成にする。出力は不変（バイト一致は維持）。
+(4)根拠: 最頻GETから Slim App + Router + Middleware の生成(数十オブジェクト/回)を恒久的に除去。コストは小さくても全hotリクエストに掛かるため積算で効く。**コード移動のみ・零リスク**。
+
+## [16:1x 第4R-③] build_list_html の「毎回の users IN クエリ」を排除（DB往復をhotパスから除去）
+(1)現象: `build_list_html`(index.php:290-291) は毎回 `$user_cache=[]` を作り `preload_users()` で `SELECT * FROM users WHERE id IN (~21)` を実行。これは投稿著者の **del_flg 判定（表示20件の選別）** のため。断片が全ヒットでもこのユーザクエリは必ず走る。
+(2)原因仮説: 断片HTMLには著者名が既に焼き込まれているので、全ヒット時にユーザ情報が要るのは「del_flg=1の著者の投稿を除外する」目的のみ。users全体は~1000行・変化は register と admin/banned のみ＝ほぼ不変なのに毎回引いている。
+(3)推奨アクション: **banされたユーザID集合(`del_flg=1`、初期~2%=約20件)** を APCu/memcached にキャッシュ（`POST /register` と `POST /admin/banned` で更新）。`build_list_html` の選別は「著者idがban集合に**無い**投稿を上位20件」で判定し、users IN クエリを撤廃。断片ミス時に必要な著者だけ個別取得（稀）。
+(4)根拠: 全リスト描画(/ /posts /@user)から同期DB往復を1本除去＝php-fpmワーカーのブロック時間短縮（mysqld負荷も微減）。del_flgはban経路のみ変化＝invalidateが単純で安全。中リスク（選別ロジックの正当性をfail0で要確認）。
+
+## [16:1x 第4R-④] 全リクエスト共通の固定費削減：opcache.preload と interned_strings_buffer
+(1)現象: `require 'vendor/autoload.php'`(index.php:8) は全リクエストで走り、Slim/Flash/PSR-7 等の vendor クラスを初回参照時にオートロード（ファイルstat＋include）する。opcache.preload は未設定、interned_strings_buffer=8Mと小さい。
+(2)原因仮説: OPcodeはキャッシュ済でも、クラスのオートロード解決（composer ClassLoader のmap探索＋ファイルstat）とクラス初期化は実行毎に発生しうる。preloadで起動時に共有メモリへ常駐させれば毎回の解決を省ける。
+(3)推奨アクション（infra係 php.ini）: `opcache.preload` に vendor の主要クラス(Slim系/PSR-7/DI/Flash)をロードするpreloadスクリプトを設定。併せて `opcache.interned_strings_buffer` を 16〜32M に。**注意**: preloadはコード変更後 fpm restart 必須（footgun）。MEMOの「JIT/vt=0は変動内で不採用」とは別物（preloadはクラス常駐化で趣旨が違う）だが、効果は中程度想定なので A/B で変動超を確認してから採用。
+(4)根拠: 全リクエストの固定費(オートロード解決)を削る。律速がphp-fpm CPUなので固定費削減は素直に効く可能性。ただし高速パスは既に使用クラスが少なく、効果は①②③より小さい見込み→優先度は中。
+
+## [16:1x 第4R-⑤] GET /posts/{id} 詳細はキャッシュ無しで毎回 make_posts（コメント投稿のたびに叩かれる）
+(1)現象: 高速パス /posts/{id}(index.php:400-414) は `make_posts(all_comments=true)` を毎回実行＝post 1クエリ＋comments全件 IN 1クエリ＋user preload。`POST /comment` が完了後この詳細へ redirect するため、コメント追加のたびに詳細が叩かれる。stage1の「データ構造キャッシュ」は-2.7%で不採用だったが、それは memcached往復+unserialize が相殺した結果。
+(2)原因仮説: 詳細ページは「投稿本体(不変)」＋「コメント列(comment_countで変化)」。本体部分は断片化でテンプレ実行を回避できる。
+(3)推奨アクション: 詳細を `pd:{id}:c{comment_count}` キーで **APCu** 断片キャッシュ（①でAPCu導入後）。本体＋コメント列をまとめて1断片に。comment_count増分で自動invalidate。memcachedで失敗した理由(往復+unserialize)はAPCu化＋HTML文字列キャッシュ(unserialize不要)で解消する可能性。①の後に再検証する価値あり。
+(4)根拠: コメント投稿シナリオで叩かれる詳細のテンプレ実行/コメントクエリを削減。①(APCu)前提なので順序は① → ⑤。中優先。
+
+## [16:1x 第4R-⑥] 高速パス GET / の細かな固定費（軽微・低リスク）
+(1)現象/推奨:
+  - **flashの遅延化**: 高速パス GET /(396行)は毎回 `$container->get('flash')->getFirstMessage('notice')` を呼び Slim\Flash を生成・オートロード。flashは「直前のredirectでsessionに積まれた通知」専用なので、**session未開始(匿名cookie無し)なら必ず空** → `session_status()===ACTIVE` の時だけ flash を引き、それ以外は `null` 即返しにすれば Slim\Flash の生成/オートロードを匿名hotパスから除去できる。
+  - **先頭の静的fチェック**(index.php:12-24 `is_file($file)`)は動的パス(/ /posts 等)でも毎回1 statを発行。nginxが静的を直配信する構成なので、PHP到達時点で静的の可能性は低い。明確に動的なメソッド/パスでは stat を省く余地（軽微）。
+  - **postsクエリの列**: 全ヒット時に必要なのは選別用の id/user_id/comment_count のみ。body/mime/created_at はミス時の断片描画にしか使わない。`SELECT id,user_id,comment_count`＋ミス分だけ本体取得にすると、毎回40行ぶんの body テキスト転送を削減できる（小）。
+(2)根拠: いずれも単体は小さいが、最頻GET /の固定費。①②の後の積み増しとして。
+
+## [16:1x 第4R] 50万への戦略まとめ（実装係向け・効果/リスク順）
+1. **① 断片キャッシュを APCu 化**（最有力。memcached往復をhotパスから除去）。`php8.3-apcu`導入が前提＝infra係と連携。APCu不可なら memcached unix socket+igbinary で次善。
+2. **② 高速パスを AppFactory::create() の前へ移動**（零リスク・コード移動のみ・全hotリクエストでSlim App生成を回避）。**まず即やる**。
+3. **③ build_list_html の users IN を ban集合キャッシュで撤廃**（hotパスから同期DB往復1本除去・中リスク・fail0要確認）。
+4. **⑤ /posts/{id} 詳細を APCu 断片キャッシュ**（①の後に再挑戦。コメント投稿シナリオに効く）。
+5. **④ opcache.preload + interned_strings_buffer 拡大**（infra係・全固定費削減・A/Bで変動超確認）。
+6. **⑥ flash遅延化・列削減等の細かな固定費**（軽微・低リスク・積み増し）。
+
+50万チームの大技推測（アプリ側）: (a)**プロセス内(APCu/OPcache preload)で完結させ、memcached/DBへの同期往復を最頻パスからほぼ消す**、(b)Slim等フレームワーク生成を完全に回避した薄いフロントコントローラ、(c)リスト/詳細をHTML断片で持ちテンプレ実行を実質ゼロに、の徹底。**律速がphp-fpm CPUなので、残る勝負は「1リクエストのPHP命令数とブロッキングI/O回数をどこまで0に近づけるか」**。本ラウンドの①②③が直撃ターゲット。要 findings_infra.md（APCu導入・preload・fpm worker配分）と突き合わせ。

@@ -180,3 +180,69 @@
 - **核心は「2コアのCPUの奪い合いを減らす」こと**。確度の高い順に: ①worker数を16→4〜8へ削減（context-switch減・mysqldにCPU譲る）＋②gzipのloopback浪費を排除、が**インフラ側で残る最大の的**。③unix socket・④immutable は数%の積み増し。
 - ただし正直な見立てとして、**170k→400kの大半はapp/db層（PHP実行コストとクエリ）でしか埋まらない**。インフラ①②③④を全部足しても効くのは合計で十数%〜数十%程度（CPUの無駄取り）で、2.3倍には届きにくい。残りは「PHPの処理量そのものを減らす」＝GET /のレンダリング軽量化・クエリ削減・(⑤の)キャッシュといったapp/db主導の構造変更が必要。
 - **次アクション提案**: まず★のCPU実測でphp-fpm vs mysqldの配分を確定 → php-fpm支配的なら①②③を順次A/B（各々変動±2.5%超で判定）→ それでも頭打ちなら⑤のマイクロキャッシュをapp係と設計。実測なしに worker や gzip をいじると変動に埋もれて判断を誤るので、**必ず実測とセットで**。
+
+---
+# ===== 第4ラウンド調査（大会 369,640, 目標 500,000）=====
+
+## 大前提の再計測（2026-06-23 16:xx, IDLE時）
+- **ボトルネックは確定済: CPU 2コア完全飽和、php-fpm=80%が壁、mysqld=29%(非律速)**（第3R実測）。脱フレームワーク/各種キャッシュ後も「PHP実行が2コアを食い尽くす」構造は不変。
+- DB実体は**極小**: posts.ibd=実10MB、imgdata=0件(完全にファイル化済)。`information_schema`の1204.5MBは**OPTIMIZE後未更新のstale統計**で実害なし。→ **buffer_pool 512MはDB全体を余裕で内包**。DBメモリ/IOは一切問題でない。
+- メモリ: used 3.1Gi / available 663Mi / Swap 0。mysqld≒1GB(大半はbuffer_pool 512M+各種)。**DBが小さい今、buffer_poolを増やす意味はゼロ**（むしろ256Mへ減らしてphp-fpm用に空ける余地すらある）。
+- 画像: public/image にファイル**のみ**(10818枚/1.6GB, DB非依存)。disk 75%(3.7G空き, /initializeで自動掃除済)。
+- 現行接続形態: nginx→php-fpm は **TCP 127.0.0.1:9000（unix socket未適用）**。MySQL `bind_address=127.0.0.1`（ローカル専用）。nginx `listen 80`（HTTP/2なし）。
+
+## [16:xx] 第4ラウンド★最優先・本丸: 複数台構成（500kはこれ無しでは到達困難）
+- (1)現象: **2コア1台では物理的にCPUが頭打ち**。app(php-fpm)が80%で壁、これ以上のPHP軽量化は逓減。369k→500k(+35%)は「PHP実行に使えるCPUコアを増やす」のが最短かつ唯一の構造的打開策。
+- (2)原因仮説: スコアは実質「2コアで捌けるPHPリクエスト数」に比例。コアを増やす＝サーバを足す以外に上限は破れない。台数が使えるなら**最大の一手はこれ**。
+- (3)推奨アクション（使える台数別の構成案。実装係＋全係で合意の上）:
+  - **【2台】DB分離（最小工事・確実）**: server1=nginx+php-fpm+memcached+画像 / server2=MySQL専用。
+    - 変更点: ①server2 mysqld.cnf `bind-address=0.0.0.0`(or 内部IP) ②`CREATE USER 'isuconp'@'<app内部IP>' ... ; GRANT`（現状はlocalhostのみ） ③appのDB接続 host=localhost→server2内部IP ④SG/firewallで3306を内部のみ開放。
+    - 効果見立て: mysqld 29%(≒0.58コア)＋memcached/カーネルのDB由来割込がserver1から消え、**php-fpm が使えるCPUが実質1.4→2コアへ拡大**。+20〜30%（≒440〜480k）を見込む。永続接続(性能5)はTCP越しでもRTT<1msなら維持可（接続数 max_children×worker数 ≤ max_connections=151に注意）。
+  - **【3台以上】app水平スケール（500k本命）**: フロントnginx(LB)＋app(php-fpm)×N＋DB×1。php-fpmが律速＝水平に台数分スケール。ベンチは1つの target IP を叩くので、その host を **nginx を `upstream { server app1; server app2; }` で振るLB** にする（または各appにnginx置きDNS/LB）。
+    - 必須の共有化（ここを外すと整合性fail）:
+      - **memcached を1ノードに集約**し全appが同じインスタンスを指す（セッション＋断片HTMLキャッシュ＋feedが全app間で一貫する必要）。listen を内部IPに、appの session.save_path とアプリMemcached接続先を共有memcached(例:DBノード)へ。
+      - **画像ファイルの共有**: 現在 public/image はローカルディスク。POSTを受けたappにしか画像が無い→他appで404。対策(いずれか): (a)画像保存先をNFS等の共有ストレージ (b)POST /（画像書込）だけを特定1ノードへルーティングし、他ノードは/imageミス時にそのノードへproxy_pass (c)フロントnginxが/imageを共有ディレクトリから直配信。**最も簡単なのは「フロントLBが画像を共有ボリュームから直配信、appは/imageを持たない」**。
+    - 効果見立て: app2台で理想2倍弱、現実1.6〜1.9倍 → **500k超は十分射程**。
+  - **段階投入を推奨**: まず【2台:DB分離】で確実に底上げ→整合機構(共有memcached/画像)を整えてから【3台:app追加】。一気に多要素変更するとfail切り分け不能になる。
+- (4)根拠: 第3R実測 php-fpm80%/mysqld29%。律速がapp(水平スケール可能)でDBが軽い＝「DBを切り離してappにコアを集中＋app増設」が綺麗に効く理想形。1台では2コアが絶対上限。
+
+## [16:xx] 第4ラウンド①: nginx⇄php-fpm の unix socket 化＋fastcgi keepalive（1台のまま・未適用の残弾）
+- (1)現象: 第1/3Rで提案済だが**未適用**。今もTCP 127.0.0.1:9000。fastcgi の upstream keepalive も無し（毎リクエストでFastCGI接続をopen/close）。
+- (2)原因仮説: 全動的リクエストでTCPループバックのsyscall＋接続確立。php-fpmが80%まで詰まった今、この固定費削減は直接スループットに乗る可能性。
+- (3)推奨アクション:
+  - pool `listen=/run/php/php8.3-fpm.sock`＋`listen.owner/group=www-data`、nginx `fastcgi_pass unix:/run/php/php8.3-fpm.sock;`。
+  - さらに `upstream fcgi { server unix:/run/php/php8.3-fpm.sock; keepalive 32; }` ＋ location で `fastcgi_pass fcgi; fastcgi_keep_conn on; include fastcgi_params;`（要 `fastcgi_param HTTP_CONNECTION ""`等の調整は基本不要）。
+  - ⚠️**測定の罠**: ローカルベンチは bench が67%CPUを奪うため socket化の数%は変動に埋もれる。**大会ベンチ（bench別マシン）でA/B**すること。
+- (4)根拠: php-fpm CPU支配下では1リクエストあたりの接続オーバーヘッド削減が積み上がる。低リスク・複数台構成とも併用可。
+
+## [16:xx] 第4ラウンド②: php-fpm max_children を「大会環境で」再チューニング（重要な測定ナンス）
+- (1)現象: 第3R local A/B で 16>8（8は-2.7%）だったため16維持。だが**そのlocal測定はbenchが67%CPUを食う環境**だった。
+- (2)原因仮説: 大会環境では bench が別マシン＝app server の2コアがフルにphp-fpmへ回る。**CPUの空き具合が違うので最適worker数も変わる**（bench非同居なら待ち時間が減り、より多workerで詰めるか、逆にCPU純飽和でコア数近くが最適か、はlocalでは判定不能）。
+- (3)推奨アクション: **大会環境で** max_children = 12 / 16 / 24 / 32 を各2回A/B。CPU実測(mpstat %idle≈0で純飽和ならコア数×2〜3程度が頭、I/O/RTT待ちがあるならさらに上)と合わせ最良点を採る。DB分離後はDB往復がTCP化しRTT待ちが増える→**worker数を上げる余地が出る**点も併せて再評価。
+- (4)根拠: 「16が最適」は同居bench下の結論で、大会/分離環境には外挿できない。メモリは16で286MBのみ＝64程度まで増やしてもメモリは余裕（avail663MB）。**メモリ制約ではなくCPU/待ちで決まる**ので実測必須。
+
+## [16:xx] 第4ラウンド③: HTTP/2 は今回**効果なし**（やらない判断の明示）
+- (1)現象: nginx `listen 80`（平文HTTP/1.1）。HTTP/2化の検討余地が観点に挙がっている。
+- (2)原因仮説: ベンチは Go の `http.Transport{}`。**標準TransportはTLS無しのh2c(平文HTTP/2)を話さない**（ALPN無し平文では HTTP/1.1 固定）。TLSを張ればHTTP/2可能だが、ローカルbench対象がhttp://localhostで、TLSハンドシェイクCPUを2コアに追加するだけで逆効果。
+- (3)推奨アクション: **HTTP/2 は今回スキップ**。工数とCPUを①(socket)や複数台に回すべき。
+- (4)根拠: クライアント(bench)がHTTP/2を要求しない以上サーバ側で有効化しても使われない。CPU律速下でTLS追加は純損失。
+
+## [16:xx] 第4ラウンド④: 細かい削り（低優先・低リスク、複数台が本筋なら後回し可）
+- access_log: 静的は既にoff。動的(/、/posts等)も大量だが、access_log を `buffer=32k flush=5s` でバッファリング or off にすればI/O/CPUを僅かに削減（ログ不要なら off）。
+- `worker_processes auto`=2で適正。`open_file_cache`は適用済。`tcp_nopush on`/`sendfile on`済。**nginx側はほぼ出し切り**。
+- buffer_pool 512M → DBが10MBしかないので **256Mへ減らしてメモリをOS/php側に空ける**ことは可能だが、メモリは現状余裕(avail663MB)で実益薄。複数台でDB分離するなら関係なくなる。
+
+## [16:xx] 第4ラウンド: ベンチ中CPU再実測の依頼（脱フレームワーク後の配分確認）
+- 第3R実測(php-fpm80/mysqld29/nginx20/bench67)は**性能4R-1〜5(断片キャッシュ/Slimバイパス/comment_count非正規化)適用前**の比率。脱フレームワークでphp-fpmのframework固定費が減った今、配分が動いているはず（php-fpmはさらに描画/DB/memcached比率へシフト、mysqldはさらに低下の見込み）。
+- 実装係へ（RUNNING中に別端末で）:
+  ```
+  mpstat -P ALL 1 10          # %idle と usr/sys
+  pidstat -u 1 10 | awk '/php-fpm|mysqld|nginx|memcached|benchmark/{a[$NF]+=$8} END{for(k in a)print k,a[k]"%"}'
+  ```
+  - 見るポイント: (a)mysqldが10%台まで落ちていれば**DB分離の伸びは限定的→app水平増設が本命**。(b)memcachedのCPU%が無視できない大きさなら共有memcached化時のネックに留意。(c)nginxが上がっていればsocket化①の効きしろ。
+
+## 第4ラウンド総括: 500kへインフラが貢献できる最大の一手（結論）
+- **最大の一手は明確に「複数台構成」**。1台2コアは物理上限で、369k→500kの+35%は単一ノードのミドルウェア削りでは届きにくい（①socket等を全部足しても数%〜十数%）。
+- 台数が使えるなら: **まず【2台=DB分離】で確実に+20〜30%**（app boxにコア集中）。**さらに台数があれば【app水平スケール】で500k超が射程**。鍵は「memcached集約」と「画像ファイル共有」の整合設計（ここを誤るとfail）。
+- 台数が1台に固定なら: 残る現実的な弾は **①unix socket化（未適用・要大会A/B）** と **②worker数の大会環境再チューニング** のみ。あとはPHP実行量削減=app/db係の領域（断片キャッシュ拡張・テンプレ実行回避）に戻る。
+- ⚠️測定規律: ローカルbenchはbench自身が67%CPUを食い数%差を覆い隠す。**①②および複数台効果は必ず大会ベンチ（bench別マシン）で、同方向・複数回・変動±2.5%超で判定**すること。

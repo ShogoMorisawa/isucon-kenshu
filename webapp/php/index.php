@@ -25,6 +25,8 @@ if (is_file($file)) {
 
 const POSTS_PER_PAGE = 20;
 const UPLOAD_LIMIT = 10 * 1024 * 1024;
+// csrf_token はユーザ固有なので断片HTMLにはプレースホルダを埋め、最後に実トークンへ置換する（高速パスより前で定義）
+const CSRF_PLACEHOLDER = '@@CSRFTOKEN@@';
 
 // memcached session
 $memd_addr = '127.0.0.1:11211';
@@ -231,6 +233,104 @@ $container->set('helper', function ($c) {
     };
 });
 
+// === 高速パス: 頻出GET endpointを Slim 非経由で直接レンダリング（framework固定費削減） ===
+// ★ AppFactory::create() より前に置くことで、高速パス該当時は Slim App/Router/Middleware の生成自体をスキップ。
+// テンプレ・変数は通常(Slim)経路と同一を使い出力HTML/Content-Typeはバイト一致（各endpointでdiff検証済）。
+// 該当しない/見つからない場合は exit せず下の Slim 初期化＋ルーティングへフォールスルー。
+// 使用する関数(build_list_html等)は top-level 宣言でホイストされ、CSRF_PLACEHOLDER は冒頭で定義済。
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    $fast_path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+
+    if ($fast_path === '/') {
+        $helper = $container->get('helper');
+        $me = $helper->get_session_user();
+        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 40');
+        $ps->execute();
+        $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
+        $post_list_html = build_list_html($helper, $rows);
+        $flash = $container->get('flash')->getFirstMessage('notice');
+        $view = 'index.php';
+        require __DIR__ . '/views/layout.php';
+        exit;
+    } elseif (preg_match('#^/posts/(\d+)$#', $fast_path, $fm)) {
+        // GET /posts/{id} 投稿詳細（全コメント）。存在時のみ高速描画、404は Slim へフォールスルー。
+        $helper = $container->get('helper');
+        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?');
+        $ps->execute([(int)$fm[1]]);
+        $results = $ps->fetchAll(PDO::FETCH_ASSOC);
+        $posts = $helper->make_posts($results, ['all_comments' => true]);
+        if (count($posts) > 0) {
+            $post = $posts[0];
+            $me = $helper->get_session_user();
+            $csrf_token = $_SESSION['csrf_token'] ?? '';
+            $view = 'post.php';
+            require __DIR__ . '/views/layout.php';
+            exit;
+        }
+        // 見つからなければ Slim 経路へ（404 応答を共通化）
+    } elseif ($fast_path === '/posts') {
+        // GET /posts ページング。※Slim経路は 'me' を渡さない＝ヘッダは常にログインリンク。$me を定義しないことで一致。
+        $helper = $container->get('helper');
+        $max_created_at = $_GET['max_created_at'] ?? null;
+        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40');
+        $ps->execute([$max_created_at === null ? null : $max_created_at]);
+        $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
+        $post_list_html = build_list_html($helper, $rows);
+        $view = 'posts.php';
+        require __DIR__ . '/views/layout.php';
+        exit;
+    } elseif (preg_match('#^/@([^/]+)$#', $fast_path, $fm)) {
+        // GET /@{account_name} ユーザページ。存在時のみ高速描画、未存在(404)は Slim へフォールスルー。
+        $helper = $container->get('helper');
+        $account_name = rawurldecode($fm[1]);
+        $user = $helper->fetch_first('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0', $account_name);
+        if ($user !== false) {
+            $db = $helper->db();
+            $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `created_at`, `mime`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC');
+            $ps->execute([$user['id']]);
+            $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
+            $post_list_html = build_list_html($helper, $rows);
+
+            $comment_count = $helper->fetch_first('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?', $user['id'])['count'];
+
+            $ps = $db->prepare('SELECT `id` FROM `posts` WHERE `user_id` = ?');
+            $ps->execute([$user['id']]);
+            $post_ids = array_column($ps->fetchAll(PDO::FETCH_ASSOC), 'id');
+            $post_count = count($post_ids);
+
+            $commented_count = 0;
+            if ($post_count > 0) {
+                $ph = implode(',', array_fill(0, count($post_ids), '?'));
+                $commented_count = $helper->fetch_first("SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ({$ph})", ...$post_ids)['count'];
+            }
+
+            $me = $helper->get_session_user();
+            $view = 'user.php';
+            require __DIR__ . '/views/layout.php';
+            exit;
+        }
+        // ユーザ未存在は Slim 経路へ（404 共通化）
+    } elseif (preg_match('#^/image/(\d+)\.(\w+)$#', $fast_path, $fm)) {
+        // GET /image フォールバック。通常画像はnginxが直配信するため、ここに来るのはファイル未存在(=404)が大半。
+        // id==0 の特殊応答(空200)は元実装に委ねるため Slim へフォールスルー。
+        $iid = (int)$fm[1];
+        if ($iid !== 0) {
+            $ext = $fm[2];
+            $mime = ['jpg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif'][$ext] ?? '';
+            $path = dirname(__DIR__) . "/public/image/{$iid}.{$ext}";
+            if ($mime !== '' && is_file($path)) {
+                header("Content-Type: {$mime}");
+                readfile($path);
+                exit;
+            }
+            http_response_code(404);
+            echo '404';
+            exit;
+        }
+        // id==0 は Slim 経路へ
+    }
+}
+
 AppFactory::setContainer($container);
 $app = AppFactory::create();
 
@@ -267,9 +367,6 @@ function feed_cache() {
     }
     return $mc;
 }
-
-// csrf_token はユーザ固有なので断片HTMLにはプレースホルダを埋め、最後に実トークンへ置換する
-const CSRF_PLACEHOLDER = '@@CSRFTOKEN@@';
 
 // 1投稿分の post.php をHTML文字列にレンダリング（csrfはプレースホルダ）。
 function render_one_post_fragment(array $post) {
@@ -379,102 +476,6 @@ function calculate_passhash($account_name, $password) {
 }
 
 // --------
-
-// === 高速パス: 頻出GET endpointを Slim/PSR-7 非経由で直接レンダリング（framework固定費削減） ===
-// テンプレ・変数は通常(Slim)経路と同一を使い、出力HTML/Content-Typeはバイト一致（各endpointでdiff検証）。
-// 該当しない/見つからない場合は exit せず通常の Slim ルーティングへフォールスルー。
-if ($_SERVER['REQUEST_METHOD'] === 'GET') {
-    $fast_path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-
-    if ($fast_path === '/') {
-        $helper = $container->get('helper');
-        $me = $helper->get_session_user();
-        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 40');
-        $ps->execute();
-        $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
-        $post_list_html = build_list_html($helper, $rows);
-        $flash = $container->get('flash')->getFirstMessage('notice');
-        $view = 'index.php';
-        require __DIR__ . '/views/layout.php';
-        exit;
-    } elseif (preg_match('#^/posts/(\d+)$#', $fast_path, $fm)) {
-        // GET /posts/{id} 投稿詳細（全コメント）。存在時のみ高速描画、404は Slim へフォールスルー。
-        $helper = $container->get('helper');
-        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?');
-        $ps->execute([(int)$fm[1]]);
-        $results = $ps->fetchAll(PDO::FETCH_ASSOC);
-        $posts = $helper->make_posts($results, ['all_comments' => true]);
-        if (count($posts) > 0) {
-            $post = $posts[0];
-            $me = $helper->get_session_user();
-            $csrf_token = $_SESSION['csrf_token'] ?? '';
-            $view = 'post.php';
-            require __DIR__ . '/views/layout.php';
-            exit;
-        }
-        // 見つからなければ Slim 経路へ（404 応答を共通化）
-    } elseif ($fast_path === '/posts') {
-        // GET /posts ページング。※Slim経路は 'me' を渡さない＝ヘッダは常にログインリンク。$me を定義しないことで一致。
-        $helper = $container->get('helper');
-        $max_created_at = $_GET['max_created_at'] ?? null;
-        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40');
-        $ps->execute([$max_created_at === null ? null : $max_created_at]);
-        $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
-        $post_list_html = build_list_html($helper, $rows);
-        $view = 'posts.php';
-        require __DIR__ . '/views/layout.php';
-        exit;
-    } elseif (preg_match('#^/@([^/]+)$#', $fast_path, $fm)) {
-        // GET /@{account_name} ユーザページ。存在時のみ高速描画、未存在(404)は Slim へフォールスルー。
-        $helper = $container->get('helper');
-        $account_name = rawurldecode($fm[1]);
-        $user = $helper->fetch_first('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0', $account_name);
-        if ($user !== false) {
-            $db = $helper->db();
-            $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `created_at`, `mime`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC');
-            $ps->execute([$user['id']]);
-            $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
-            $post_list_html = build_list_html($helper, $rows);
-
-            $comment_count = $helper->fetch_first('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?', $user['id'])['count'];
-
-            $ps = $db->prepare('SELECT `id` FROM `posts` WHERE `user_id` = ?');
-            $ps->execute([$user['id']]);
-            $post_ids = array_column($ps->fetchAll(PDO::FETCH_ASSOC), 'id');
-            $post_count = count($post_ids);
-
-            $commented_count = 0;
-            if ($post_count > 0) {
-                $ph = implode(',', array_fill(0, count($post_ids), '?'));
-                $commented_count = $helper->fetch_first("SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ({$ph})", ...$post_ids)['count'];
-            }
-
-            $me = $helper->get_session_user();
-            $view = 'user.php';
-            require __DIR__ . '/views/layout.php';
-            exit;
-        }
-        // ユーザ未存在は Slim 経路へ（404 共通化）
-    } elseif (preg_match('#^/image/(\d+)\.(\w+)$#', $fast_path, $fm)) {
-        // GET /image フォールバック。通常画像はnginxが直配信するため、ここに来るのはファイル未存在(=404)が大半。
-        // id==0 の特殊応答(空200)は元実装に委ねるため Slim へフォールスルー。
-        $iid = (int)$fm[1];
-        if ($iid !== 0) {
-            $ext = $fm[2];
-            $mime = ['jpg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif'][$ext] ?? '';
-            $path = dirname(__DIR__) . "/public/image/{$iid}.{$ext}";
-            if ($mime !== '' && is_file($path)) {
-                header("Content-Type: {$mime}");
-                readfile($path);
-                exit;
-            }
-            http_response_code(404);
-            echo '404';
-            exit;
-        }
-        // id==0 は Slim 経路へ
-    }
-}
 
 $app->get('/initialize', function (Request $request, Response $response) {
     $this->get('helper')->db_initialize();

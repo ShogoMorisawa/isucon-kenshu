@@ -212,3 +212,88 @@ GET / が最頻エンドポイントで、現状1リクエストあたり概ね5
 3. ③index母数LIMIT削減（小）・④/@user冗長クエリ削除（小）
 - 🔑 重要認識: **DBは hit率1000/1000・disk read 0 で既に高速。40万への鍵は「クエリ本数削減」と「キャッシュでDBを回避」**。
   純粋なDBチューニング（index/my.cnf）の伸びしろは尽きた。次の主戦場はアプリのキャッシュ設計とPHP-CPU/インフラ。
+
+---
+---
+
+# 第4ラウンド調査（大会 369,640 / 出発292,146 → 目標500,000 / 2026-06-23 / 信号機IDLE時計測）
+
+## 前提の再確認（実測）
+- 接続は **unix socket** 接続済（`host=localhost`→mysqlnd が `/var/run/mysqld/mysqld.sock` 使用）。TCPループバックの syscall 浪費は無し＝**socket化の手当ては不要**。
+- 全データ完全メモリ常駐（前R: hit率1000/1000, disk read 0）。件数: posts≈10,818 / comments≈101,497 / users≈2,595。
+- 機械は **2コア / 3.8GB、CPU飽和、php-fpm=80%が壁・mysqld=29%**（ローカル同居計測）。
+  ただし大会ベンチは別マシン→ローカルの比率そのままではない。**残るDB施策は「mysqld CPUを削る」より「PHPが扱うデータ量・往復を削る」方向が効く**。
+
+## 残っているDBアクセスの棚卸し（断片キャッシュ後）
+脱フレーム＋断片キャッシュで GET / の往復は激減したが、**毎 GET / と POST / 応答で必ず1本走る固定クエリ**が残る：
+```
+SELECT id,user_id,body,mime,created_at,comment_count
+  FROM posts FORCE INDEX (idx_created_at) ORDER BY created_at DESC LIMIT 40   (index.php:392,592)
+```
+EXPLAIN: `type:index / key:idx_created_at / rows:40 / Backward index scan`。
+→ **Extra に "Using index" が無い** = idx_created_at は (created_at) 単独のため、40件ぶん**クラスタPK lookupで body(TEXT)/user_id/mime/comment_count を毎回materialize**している。
+断片キャッシュが**ヒットする投稿では body も user も使わない**（鍵は `pf:{id}:c{comment_count}` のみ）。**毎GET/で40件のTEXT body をDBから引きPHP配列に展開するのは純粋な無駄**（mysqld CPU＋php-fpm CPU両方を食う）。
+
+## [16:1x] ① フィード用 covering index で「鍵取得」をindex-onlyにし、本体fetchをミス分だけに【最優先・低リスク】
+- (1)現象: 上記フィードクエリが毎回40件フル行（TEXT body含む）をfetch。断片ヒット時はそのうち id と comment_count しか使わない。
+- (2)原因仮説: 鍵算出 (id, comment_count) のためだけに全カラムを引いている。covering indexが無いのでPK lookup＋body読みが発生。
+- (3)推奨アクション（DB＋アプリ係連携）:
+  - `ALTER TABLE posts ADD INDEX idx_feed (created_at, comment_count);`（leafにPK id を含むので id も index-only で取れる）
+  - GET / の処理を2段に：
+    1. 鍵用クエリ `SELECT id, comment_count FROM posts USE INDEX (idx_feed) ORDER BY created_at DESC LIMIT 40`
+       → EXPLAIN期待値 **Using index; Backward index scan**（テーブル無アクセス）。
+    2. 断片 getMulti → **ミスした post_id だけ** `SELECT id,user_id,body,mime,created_at FROM posts WHERE id IN (missed)` で本体取得。
+  - 効果: ヒット率が高い通常時、毎GET/の「40件PK lookup＋TEXT body読み＋PHP配列展開」が消え、index-only 40件＋ミス分のみに。
+    **mysqld CPUとphp-fpm CPU(body文字列のPDO materialize)を同時に削減**＝律速のphp-fpmにも効く。
+  - コスト: 二次index1本増。`POST /`(新規post)と`POST /comment`(comment_count+1)で idx_feed も更新されるが、書き込みは低頻度で軽微。
+- (4)根拠: 毎GET/固定の40行フル取得→index-only化。最頻endpointの固定費を直接削る。FORCE INDEXは idx_feed へ張り替え（idx_created_at は /posts の created_at<=? 用に残置可、または idx_feed が両方を兼ねられるか検証）。
+
+## [16:1x] ② フィードの id 一覧自体を memcached 化し、GET / を「DB往復ゼロ」に【高天井・要設計】
+- (1)現象: ①でもフィードクエリ1本は毎GET/残る。これも消せる。
+- (2)着眼: **フィードの「並び順と表示40件のid」は新規投稿(POST /)でしか変わらない**。新規コメントは順序を変えず comment_count だけ変える。
+- (3)推奨アクション（アプリ主導／DB観点の提案）:
+  - 「最新40件の post_id 順リスト」を memcached にキャッシュし、**invalidate は POST /(新規投稿)時のみ**（コメントでは無効化不要＝高ヒット率）。
+  - 各 post の comment_count も memcached に増分キャッシュ（POST /comment で increment、DBの非正規化列と二重更新）。
+  - これで GET / は **memcached だけで鍵を組み立て→断片getMulti**＝**DBクエリ完全ゼロ**（ミス時のみ本体/コメントをDBへ）。
+  - ※過去に feed_version+index:v データキャッシュは撤廃した経緯あり（フル行キャッシュで unserialize 相殺）。今回は**軽量な id+count のみ**をキャッシュする点が異なり、unserializeコストが桁違いに小さい。
+- (4)根拠: 最頻 GET / の唯一残るDB往復を消す。①の上位互換だが invalidation 設計の正確さ（fail0維持）が条件。①を先に入れ、②は余力で。
+
+## [16:1x] ③ 複数台構成（DB分離）── CPU2コア飽和に対する構造的レバー【大会topology次第で最大】
+- (1)現象: ローカルは2コア飽和でphp-fpmが壁。**単一ホストのCPUが物理的上限**。50万到達チームは複数台に分散している可能性が高い。
+- (2)見立て: 大会が複数サーバを提供しているなら、**MySQL を2台目へ分離**すればアプリ機の2コアを丸ごと nginx+php-fpm に明け渡せる。mysqld(ローカル29%相当)ぶんのCPUが空く＝php-fpm スループット上昇。
+- (3)推奨アクション（DB側の分離準備。インフラ係と要連携）:
+  - `bind-address = 0.0.0.0`、`GRANT ... TO 'isuconp'@'<appサーバIP>'`（または '%'）、ファイアウォール3306開放。
+  - アプリの接続を `ISUCONP_DB_HOST=<DB機IP>` でTCPへ（socket→TCPでlatency微増するが、1台ぶんのCPU獲得が圧勝）。**PDO永続接続は維持必須**（接続確立コストをネットワーク越しで毎回払わないため）。
+  - 専用DB機では `innodb_buffer_pool_size` をさらに増やせる（imgdata除去後データは数十MBで余裕）。`innodb_flush_log_at_trx_commit=2` 維持。
+  - **memcached の置き場所に注意**: アプリを2台に増やすなら断片キャッシュ＋セッションは**共有memcached**（ネットワーク上）に集約しないと整合が崩れる。アプリ1台＋DB1台ならmemcachedはアプリ機据え置きでよい。
+- (4)根拠: CPUバウンドな単一ホストを横に割るのがISUCON的50万定石。**効果は最大級だが大会のサーバ台数に依存**＝まず台数確認を。
+
+## [16:1x] ④ /@user(getAccountName) の集計クエリ非正規化（中〜小）
+- (1)現象: index.php:804 posts WHERE user_id（LIMIT無）、:809 `COUNT(*) comments WHERE user_id`、:534相当 commented_count(`COUNT comments WHERE post_id IN(ユーザの全post)`)。
+  実測: 1ユーザの最大投稿数23・comments WHERE user_id は ref/Using index/rows~101 で軽量。
+- (2)原因仮説: /@user は GET / ほど高頻度ではないが、3本のクエリ＋IN集計が毎回走る。
+- (3)推奨アクション（優先度中の下）:
+  - `users` に `post_count` / `comment_count`(本人のコメント数) 非正規化列を持たせ POST /・POST /comment で増分 → :804の件数と:809を消せる。
+  - commented_count（自投稿への被コメント総数）は `posts.comment_count` を**ユーザの全postでSUM**すれば comments を引かず算出可：
+    `SELECT COUNT(*) cnt, SUM(comment_count) commented FROM posts WHERE user_id=?`（idx_user_created でrange、Using indexにcomment_count含めれば covering）。
+  - posts WHERE user_id に表示ぶんの LIMIT を付ける（最大23行なので効果小）。
+- (4)根拠: /@user の往復を3→1〜2本へ。頻度が中のため①②③より下。
+
+## 書き込み経路の評価（POST / / POST /comment）── 現状ほぼ最適
+- `POST /comment`(index.php:732,741): `INSERT INTO comments` + `UPDATE posts SET comment_count=comment_count+1 WHERE id=?`（PK更新）。2本ともindex効き軽量。`flush_log_at_trx_commit=2`でcommitも安価。**ボトルネックでない**。①でidx_feed追加時、この UPDATE が idx_feed(comment_count) も更新する点だけ留意（行は1件・軽微）。
+- `POST /`(index.php:671): `INSERT INTO posts`（imgdata=''）。ファイル書き出しはアプリ/インフラ管轄。DB的に問題なし。
+- → 書き込みは低頻度かつ最適化済。**50万へのDB側レバーは読み取り(GET /)固定費の削減＝①②と、構造の③**。
+
+## 50万点チームがDB側でやっている可能性（推測）
+1. **GET / を完全にDBレス化**（②：軽量id+countキャッシュ or フルHTMLキャッシュ）。最頻endpointのDB往復を消す。
+2. **covering index で全ホット読みを index-only 化**（①）。TEXT body をホットパスで引かない。
+3. **MySQL/memcached を別サーバへ分離**（③）し、アプリ機CPUを独占。CPUバウンド単一ホストの構造打破。
+4. 書き込みは write-through キャッシュ＋非正規化で集計クエリ全廃（④の発展）。
+5. （DB単体my.cnfは hit率1000/1000・I/O0 の今、追いチューニングの伸びは無い＝やらない）。
+
+## 第4ラウンドまとめ（実装係向け・効果順）
+1. **①フィード covering index `idx_feed (created_at, comment_count)` ＋ GET / を「鍵index-only取得→ミス分だけ本体fetch」の2段化**。最頻GET/の40件フル行(TEXT body)取得を撲滅。mysqld/php-fpm両方に効く・低リスク。★最優先
+2. **③MySQL別サーバ分離**（大会が複数台提供なら最大レバー。bind-address/GRANT/TCP+永続接続/memcached配置をインフラ係と設計）。まず**提供サーバ台数の確認**を。
+3. **②GET / のフィードid一覧 memcached 化でDB往復ゼロ**（①の上位互換・高天井。invalidationはPOST /時のみで高ヒット率。fail0維持が条件）。
+4. ④/@user の集計を users 非正規化＋`SUM(posts.comment_count)`で往復削減（中〜小）。
+- 🔑 結論: **DBの「速度」はもう限界まで来ている。残る伸びは(a)ホットパスでDBを触る回数・量を更に削る[①②④]、(b)サーバを横に割ってCPUを増やす[③]の2系統**。純DBチューニング(index追加/my.cnf)単独の伸びは無い。

@@ -328,3 +328,62 @@ template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(layout.html, in
 5. 副次: getPostsID の SELECT * 限定、詳細ページのテンプレ事前パース、getImageのServeFile。
 
 要点: **「ローカルで速いのに大会で負ける」＝高RPS・長時間でしか露呈しない固定費(=毎回テンプレparse)とGC劣化(=無制限キャッシュ)が犯人**。PHPはOPcache(parse償却)＋FPMのGC無し＋memcached eviction で高負荷に強い。Goでも 1.テンプレ事前パース と 2.キャッシュeviction を入れれば、構造的優位(no-bootstrap/in-process cache)が大会スコアに反映されるはず。要 findings_infra.md（GOGC/GOMAXPROCS）・findings_db.md（idx_feed が covering か）と突き合わせ。
+
+---
+
+# [18:0x Go第2R] Go 479,617 → 目標 693,053（トップ, あと約1.4倍）の次のボトルネック
+
+確認済(適用済): テンプレ事前パース(`cachedTmpl`/`sync.Map`)、断片キャッシュ＋上限eviction(`fragStore`/fragCacheLimit)、ban集合、digest native、unix socket、interpolateParams、コネクションプール(64/64)。
+→ テンプレparseが消えた今、**最頻GET(/ ・ /posts)で残る同期コストとアロケーション**が次の壁。コードから推定する律速を効果順に。
+
+## 計測準備（最優先・推測を裏取りする土台）
+- **pprof 未導入**（`net/http/pprof` 非import確認）。`GOGC`/`GOMAXPROCS` 未設定（既定 GOGC=100, GOMAXPROCS=2）。CPUは2コア。
+- 推奨: `import _ "net/http/pprof"` を入れ、別goroutineで `http.ListenAndServe("localhost:6060", nil)`。ベンチ中に `go tool pprof http://localhost:6060/debug/pprof/profile?seconds=20` を取得。**以下①〜③のどれが実際に重いかを確定**してから着手するのが最短（実装係依頼）。
+
+## 【最有力①】セッションが認証済リクエスト毎に memcached 往復している
+(1)現象: `getSession`→`store.Get`（gsm = gorilla-sessions-**memcache**）は、cookie付き(=認証済)リクエストで**毎回 memcached GET＋gob デコード**してセッションを読む。`getIndex` 等の最頻GETは getSessionUser でこれを必ず通る（gorillaのper-requestレジストリで1リクエスト1回には集約されるが、**1往復は残る**）。MEMOより「GET /は認証済が主」＝大半がこの往復を払っている。
+(2)原因仮説: テンプレparseを消した今、ホットパスに残る唯一のネットワーク同期I/Oがこのセッションロード。memcached往復(数十〜100µs)＋gobデコードのアロケが全認証GETに乗る＝スループット天井を直接縛る。userCache(in-process)でDBは消えたが、**セッションだけ外部往復のまま**。
+(3)推奨アクション（いずれか）:
+  - **(本命) セッションを署名cookieに格納**（gorilla `CookieStore`/`securecookie`）。session中身は user_id＋csrf_token のみで極小。cookieに入れればサーバ側ストアが不要＝**memcached往復が完全消滅**、HMAC検証＋小gobデコードのみ（CPU内・ゼロ往復）。/initialize やログインの整合は維持。リスク中（cookie形式変更。ベンチは毎回ログインし直すので実害小）。
+  - **(低リスク) session-id→デコード済セッションを in-process `sync.Map` キャッシュ**。同一ユーザは同cookieで多数リクエストするためヒット率高。login/logout/register でそのidを無効化。memcached往復を再訪リクエストから除去。
+(4)根拠: 最頻パス唯一の外部同期I/Oを除去。in-process化はGoの構造的優位そのもの。**①が今ラウンド最大の伸びしろ候補**。pprofで `gomemcache`/`gob` がCPU上位なら確定。
+
+## 【②】リストページの html/template.Execute と csrf合成(ReplaceAll×20)を排除
+(1)現象: 
+  - 断片はすでに完成HTML(`Rendered`)なのに、`getIndex`/`getPosts`/`getAccountName` は **html/template.Execute** で posts.html を range 実行（reflection＋html/templateの安全機構が全リクエストで走る）。
+  - `buildListPosts`(321,384) は**投稿1件ごとに** `strings.ReplaceAll(frag, "@@CSRFTOKEN@@", csrf)`＝20件で**20回フルスキャン＋20本の新規string確保**。**全ヒット時でも毎回発生**（post.html の csrf は comment フォームの hidden 1箇所=L30、確認済）。
+(2)原因仮説: テンプレparse除去後、リスト描画の残コストは「Execute のreflection」＋「per-fragment ReplaceAllのアロケ」。高RPSでGCゴミと化す。
+(3)推奨アクション（段階）:
+  - **(即) csrf置換を1回化**: 断片を `strings.Builder` で連結→**連結後の全体に1回だけ ReplaceAll**（PHP版と同じ）。20アロケ→1。
+  - **(踏み込み) リストページを html/template を介さず生バイト連結で組む**: 断片HTMLは完成済なので、ヘッダ(me/ログインリンク)＋投稿フォーム(csrf)＋連結済リスト＋フッタを `strings.Builder`/`[]byte` で直結し `w.Write`。reflectionベースのExecuteを最頻パスから除去。出力バイト一致を要diff検証。
+  - **(最大) 連結済みリスト本体HTMLを丸ごとキャッシュ**: 可視投稿の (id,comment_count) 並びを署名にしたキーで「連結済み本体(csrfプレースホルダ入り)」を sync.Map キャッシュ。GET /全ヒット時は「軽量クエリ＋本体1取得＋csrf 1回置換＋ヘッダ合成」だけになり、断片ループ自体も消える。
+(4)根拠: Execute のreflectionと20回アロケを削減。②(即)は零〜低リスクで今すぐ。生バイト化／本体キャッシュは中工数だが効果大。
+
+## 【③】sync.Pool でバッファ再利用＋GOGC調整（GC圧削減・CPU専有環境で効く）
+(1)現象: 各リクエストで `strings.Builder`(renderFragment)、ReplaceAll の新規string、`[]Post`/`map[int][]Comment`/userMap 等を都度確保。`renderFragment` の Builder も毎回new。GOGC=既定100で、2コア専有・高RPSだとGCがCPUを奪う。
+(2)原因仮説: 大会CPU専有＝アロケ由来のGCがそのままスループット損。PHP-FPM(GC無し)に対するGoの弱点を埋め切れていない。
+(3)推奨アクション: (a)レスポンス組み立て用 `strings.Builder`/`bytes.Buffer` を `sync.Pool` で再利用（②の生バイト化と併せると効果大）。(b)`GOGC=200`〜`400` 程度に上げGC頻度を下げる（メモリに余裕がある前提。infra係と。MEMOのメモリ枠要確認）。(c)`buildListPosts` の `out`/`keys`/`missIdx` 等は容量プリアロック済だが、ホットなら Pool 化検討。
+(4)根拠: GCサイクル削減＝実効CPUが増える。①②でアロケ源を減らした上で GOGC を上げると相乗。pprofの `runtime.gcBgMarkWorker` 割合で効果を確認。
+
+## 【④】GET /posts/{id} 詳細：断片キャッシュ無し＋`SELECT *`（コメント投稿後に必ず叩かれる）
+(1)現象: `getPostsID`(836) は `SELECT *`(imgdata列含む。現在空だが取得は走る)＋`makePosts(all_comments=true)` を毎回実行＝本体1+コメント全件IN+ユーザIN。`postComment` 後に必ず `/posts/{id}` へredirectするため、**コメント投稿シナリオで高頻度**に叩かれる経路。断片化されていない。
+(2)推奨アクション: (a)`SELECT id,user_id,body,mime,created_at,comment_count` にカラム限定（imgdata除外）。(b)本体＋コメント列を `pd:{id}:c{comment_count}` で断片キャッシュ（comment_count増分で自動invalidate）。コメント追加→count変化→新キーで再生成＝即時可視。
+(3)根拠: 高頻度経路のDB往復とExecuteを削減。①②③ほどではないがコメント多シナリオで効く。
+
+## 【⑤】GET /@user の冗長クエリ（中traffic）
+(1)現象: `getAccountName` は posts を2回引く（714: 一覧用 results＝LIMIT無で全件、734: post_ids/post_count用）。さらに user別 COUNT(727) と commented_count(755) を毎回DB集計。
+(2)推奨アクション: 734の再取得を 714 の results から `len`/idで賄い削除。postCountも results 由来に。COUNT系はユーザページ表示頻度が中なら user単位でキャッシュ可（comment投稿でinvalidate）。
+(3)根拠: ユーザページのDB往復削減。優先度は①〜④の下。
+
+## 補足: 通知/ポーリング系endpointは無い
+- ルートは login/register/logout/`/`/posts/posts{id}/`/`(POST)/image/comment/admin/banned/@user のみ。**自動ポーリングや /fetch 系は存在しない**。「もっと見る」= `GET /posts?max_created_at=` はボタン起因のページングで、列処理は `/` と同じ `buildListPosts` 経由＝①②の改善がそのまま効く。新規の高頻度endpoint対策は不要。
+
+## 結論（実装係向け・480k→690kへ効果順）
+1. **① セッションの memcached 往復を消す**（cookie格納 or session in-processキャッシュ）。最頻パス唯一の外部同期I/O＝最大の伸びしろ。
+2. **② リスト描画の脱html/template＋csrf置換1回化**（即: ReplaceAll 1回化 / 踏み込み: 生バイト連結 / 最大: 連結済本体キャッシュ）。reflectionと20アロケを除去。
+3. **③ sync.Pool＋GOGC調整**（①②でアロケ源を絞った上でGCを減らす）。
+4. **④ /posts/{id} 詳細の断片キャッシュ＋SELECT列限定**（コメント投稿シナリオ）。
+5. **⑤ /@user 冗長クエリ削減**。
+0. **（先に）pprof導入で①〜③のどれが実際に重いかを確定**してから着手。
+
+69万チームの大技推測（アプリ側）: (a)**セッションをcookie/オンメモリ化し外部ストア往復をゼロに**、(b)**ホットページを html/template に通さず事前レンダリング断片の生バイト連結で組み、レスポンス本体をまるごとキャッシュ**、(c)`sync.Pool`＋`GOGC`チューニングでGCを限界まで抑制、(d)2コアをアプリが専有できるよう nginx/mysql とのCPU配分最適化(infra)。本ラウンドの①②③が直撃。要 findings_infra.md（GOGC/GOMAXPROCS/CPU配分）と突き合わせ。

@@ -120,13 +120,11 @@ $container->set('helper', function ($c) {
         }
 
         public function get_session_user() {
+            // ログイン時に id/account_name/authority をセッション(memcached)へ格納済みなのでDBを引かない
             if (!isset($_SESSION['user'], $_SESSION['user']['id'])) {
                 return null;
             }
-
-            $user = $this->fetch_first('SELECT * FROM `users` WHERE `id` = ?', $_SESSION['user']['id']);
-
-            return $user ?: null;
+            return $_SESSION['user'];
         }
 
         // 指定id群のうち未キャッシュのユーザを1クエリ(IN)でまとめて取得し $cache に充填
@@ -289,6 +287,8 @@ $app->post('/login', function (Request $request, Response $response) {
     if ($user) {
         $_SESSION['user'] = [
             'id' => $user['id'],
+            'account_name' => $user['account_name'],
+            'authority' => $user['authority'],
         ];
         $_SESSION['csrf_token'] = bin2hex(random_bytes(16));
         return redirect($response, '/', 302);
@@ -338,6 +338,8 @@ $app->post('/register', function (Request $request, Response $response) {
     ]);
     $_SESSION['user'] = [
         'id' => $db->lastInsertId(),
+        'account_name' => $account_name,
+        'authority' => 0,
     ];
     $_SESSION['csrf_token'] = bin2hex(random_bytes(16));
     return redirect($response, '/', 302);

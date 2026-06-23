@@ -21,6 +21,7 @@
 | 2026-06-23 12:5x | **168597** (pass, success160084/**fail0**) | 【性能5】PDO `ATTR_PERSISTENT=>true`。接続確立コスト削減。160239→168597(+5%)。max_connections=151に対し常駐~16で安全。採用 |
 | 2026-06-23 13:0x | **169984** (pass, success161353/**fail0**) | 【仕上げ6】csrf_token警告抑制。views(post/index/banned).phpの `$_SESSION['csrf_token']`→`?? ''`。168597→169984(+0.8%,変動内)だがerror.log肥大(32MB)を停止。採用 |
 | 2026-06-23 13:1x | 166-170k (A/B複数回) | 【仕上げ7】opcache本番化をA/B。JIT(tracing)+validate_timestamps=0=166.0/166.8k、vt=0のみ=169.3k、default=165.9/170.0k。**全て±2.5%の変動幅内で有意差なし**。JITは僅かに不利寄り。footgun(vt=0はコード変更後restart必須)回避のため**defaultへ revert**。スコア確定値は ~170k(169984)とみなす |
+| 2026-06-23 13:15 | **170284 / 169319** (pass, fail0/2回) | 【性能1】get_session_user のDB SELECT撤廃→session(memcached)のid/account_name/authorityを返す。score変動幅内(baseline169984比±0)だが**mysqld CPU(39%)を全認証リクエストから1往復削減**＋step4の土台。零リスク・全員一致で採用 |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。
@@ -35,6 +36,10 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 13:15 【性能1】get_session_user のセッションキャッシュ化（index.php）。score 変動内・mysqld往復削減。
+  - `POST /login`・`POST /register` で `$_SESSION['user']` に id/account_name/authority を格納。
+  - `get_session_user()` はDBを引かず `$_SESSION['user']` を返すだけ。全認証リクエストから `SELECT users` 1往復を除去。
+  - 注: del_flg/authority のban即時反映はしないが、現状get_session_userもdel_flg未チェックで挙動同等。banは/admin経路のみ。
 - 2026-06-23 13:1x 【仕上げ7・不採用】opcache JIT/validate_timestamps=0 を A/B 検証→**default へ revert**。
   - 結果は全て±2.5%変動幅内で有意差なし。JITはむしろ僅かに不利。`/etc/php/8.3/fpm/conf.d/99-opcache-tuning.ini` は削除済（default: opcache On / validate_timestamps On / JIT off）。
   - 📐 教訓: **このベンチは±2.5%の変動がある**。1〜2回の差(数千点)では効果と判定しない。明確な効果は同方向で複数回・変動幅超のときのみ採用。

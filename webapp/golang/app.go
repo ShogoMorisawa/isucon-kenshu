@@ -86,6 +86,9 @@ func dbInitialize(ctx context.Context) {
 		"DELETE FROM comments WHERE id > 100000",
 		"UPDATE users SET del_flg = 0",
 		"UPDATE users SET del_flg = 1 WHERE id % 50 = 0",
+		// comment_count 非正規化列を再集計（DELETE後の残データに合わせる）
+		"UPDATE posts SET comment_count = 0",
+		"UPDATE posts p JOIN (SELECT post_id, COUNT(*) c FROM comments GROUP BY post_id) x ON p.id = x.post_id SET p.comment_count = x.c",
 	}
 
 	for _, sql := range sqls {
@@ -175,52 +178,110 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
+// 指定id群のユーザを1クエリ(IN)でまとめて取得（dedup）。Step3でsync.Mapキャッシュ化予定。
+func getUsersByIDs(ctx context.Context, ids []int) (map[int]User, error) {
+	result := map[int]User{}
+	if len(ids) == 0 {
+		return result, nil
+	}
+	seen := map[int]bool{}
+	uniq := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			uniq = append(uniq, id)
+		}
+	}
+	query, args, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", uniq)
+	if err != nil {
+		return nil, err
+	}
+	var users []User
+	if err := db.SelectContext(ctx, &users, db.Rebind(query), args...); err != nil {
+		return nil, err
+	}
+	for _, u := range users {
+		result[u.ID] = u
+	}
+	return result, nil
+}
+
+// N+1を排除した makePosts。per-post COUNT は posts.comment_count(非正規化列, results に含む)を使用、
+// コメント・ユーザは IN 一括取得。del_flg=0 の投稿を最大 postsPerPage 件。
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
 
+	// 1) 投稿著者を一括取得し del_flg=0 の投稿を選別
+	postUserIDs := make([]int, 0, len(results))
 	for _, p := range results {
-		err := db.GetContext(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
-		}
+		postUserIDs = append(postUserIDs, p.UserID)
+	}
+	userMap, err := getUsersByIDs(ctx, postUserIDs)
+	if err != nil {
+		return nil, err
+	}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.SelectContext(ctx, &comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := range comments {
-			err := db.GetContext(ctx, &comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
+	selected := make([]Post, 0, postsPerPage)
+	for _, p := range results {
+		u, ok := userMap[p.UserID]
+		if ok && u.DelFlg == 0 {
+			p.User = u
+			p.CSRFToken = csrfToken
+			selected = append(selected, p)
+			if len(selected) >= postsPerPage {
+				break
 			}
 		}
+	}
+	if len(selected) == 0 {
+		return []Post{}, nil
+	}
 
-		// reverse
+	// 2) 選択投稿のコメントを IN 一括取得（DESC）
+	postIDs := make([]int, len(selected))
+	for i, p := range selected {
+		postIDs[i] = p.ID
+	}
+	cquery, cargs, err := sqlx.In("SELECT * FROM `comments` WHERE `post_id` IN (?) ORDER BY `created_at` DESC", postIDs)
+	if err != nil {
+		return nil, err
+	}
+	var allComments2 []Comment
+	if err := db.SelectContext(ctx, &allComments2, db.Rebind(cquery), cargs...); err != nil {
+		return nil, err
+	}
+
+	// 3) コメント著者を一括取得
+	commentUserIDs := make([]int, 0, len(allComments2))
+	for _, c := range allComments2 {
+		commentUserIDs = append(commentUserIDs, c.UserID)
+	}
+	cUserMap, err := getUsersByIDs(ctx, commentUserIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4) post_id ごとに振り分け（!allComments なら最新3件）
+	commentsByPost := map[int][]Comment{}
+	for _, c := range allComments2 {
+		if allComments || len(commentsByPost[c.PostID]) < 3 {
+			c.User = cUserMap[c.UserID]
+			commentsByPost[c.PostID] = append(commentsByPost[c.PostID], c)
+		}
+	}
+
+	posts := make([]Post, 0, len(selected))
+	for _, p := range selected {
+		comments := commentsByPost[p.ID]
+		// reverse (DESC -> 表示は古い順)
 		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
 			comments[i], comments[j] = comments[j], comments[i]
 		}
-
 		p.Comments = comments
-
-		err = db.GetContext(ctx, &p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
-		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
-			break
-		}
+		// p.CommentCount は非正規化列の値（results 由来）をそのまま使用
+		posts = append(posts, p)
 	}
 
 	return posts, nil
@@ -267,6 +328,20 @@ func getTemplPath(filename string) string {
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dbInitialize(ctx)
+	// db_initialize は posts id>10000 を削除する。対応する画像ファイルも掃除し
+	// ベンチ毎のアップロード画像がディスクに累積してフルになるのを防ぐ（PHP実装と同様）。
+	if entries, err := os.ReadDir("../public/image"); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			idStr := name
+			if dot := strings.IndexByte(name, '.'); dot >= 0 {
+				idStr = name[:dot]
+			}
+			if id, err := strconv.Atoi(idStr); err == nil && id > 10000 {
+				os.Remove("../public/image/" + name)
+			}
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -394,7 +469,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` USE INDEX (idx_feed) ORDER BY `created_at` DESC LIMIT 40")
 	if err != nil {
 		log.Print(err)
 		return
@@ -441,7 +516,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -530,7 +605,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` USE INDEX (idx_feed) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40", t.Format(ISO8601Format))
 	if err != nil {
 		log.Print(err)
 		return
@@ -660,13 +735,14 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// imgdataはDBに保存せず（''）ファイル配信のみ。PHP実装と同様。
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
 	result, err := db.ExecContext(
 		ctx,
 		query,
 		me.ID,
 		mime,
-		filedata,
+		[]byte{},
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -680,11 +756,19 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 画像を静的ファイルへ書き出し（nginx直配信用・GET /image はこのファイルに依存）
+	ext := map[string]string{"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif"}[mime]
+	if ext != "" {
+		if err := os.WriteFile(fmt.Sprintf("../public/image/%d.%s", pid, ext), filedata, 0644); err != nil {
+			log.Print(err)
+			return
+		}
+	}
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
 func getImage(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	pidStr := r.PathValue("id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
@@ -692,28 +776,21 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	post := Post{}
-	err = db.GetContext(ctx, &post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
+	// 画像はファイル配信（imgdataはDBに保持しない）。通常はnginxが直配信し、ここに来るのはファイル未存在時。
+	// 念のためファイルが在ればGoからも返す。無ければ404。
 	ext := r.PathValue("ext")
-
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
-		if err != nil {
-			log.Print(err)
-			return
-		}
+	mime := map[string]string{"jpg": "image/jpeg", "png": "image/png", "gif": "image/gif"}[ext]
+	if pid == 0 || mime == "" {
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-
-	w.WriteHeader(http.StatusNotFound)
+	data, err := os.ReadFile(fmt.Sprintf("../public/image/%d.%s", pid, ext))
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", mime)
+	w.Write(data)
 }
 
 func postComment(w http.ResponseWriter, r *http.Request) {
@@ -738,6 +815,12 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)"
 	_, err = db.ExecContext(ctx, query, postID, me.ID, r.FormValue("comment"))
 	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	// 非正規化列を増分更新（comment_count を真値に保つ）
+	if _, err := db.ExecContext(ctx, "UPDATE `posts` SET `comment_count` = `comment_count` + 1 WHERE `id` = ?", postID); err != nil {
 		log.Print(err)
 		return
 	}

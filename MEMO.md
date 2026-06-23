@@ -222,3 +222,9 @@ cd /home/isucon/private_isu/benchmarker
 ### 第5R-1【切替+可逆性】stock Go 起動。fail0(ローカル19885, 最適化前). 
 - app.go の Post 構造体に `db:"comment_count"` タグ追加（schema変更でSELECT *がsqlx mapエラーになるのを修正）。
 - 可逆性確認: PHP⇄Go 切替OK、isu-go enabled(再起動耐性)。→大会ベンチで Go 初期スコア計測待ち。
+### 第5R-2【画像ファイル化 + N+1解消/comment_count/idx_feed】Go移植。ローカルfail0(141,159, stock比7x)。
+- 画像: postIndex はファイル書き出し＋imgdata=''でINSERT。getImage はファイル配信(無→404)。getInitialize で id>10000 画像掃除。
+- makePosts: per-post COUNT廃止→posts.comment_count列使用。コメント/ユーザを sqlx.In で一括取得（N+1排除）。postComment で comment_count++、dbInitialize で再集計。
+- フィードクエリ: getIndex/getPosts は `USE INDEX (idx_feed)` + comment_count列取得。
+- Post構造体 comment_count タグ済。テンプレは canonical(Ruby/PHP同一DOM)を不変で使用。
+- 検証: 全ページ200・画像配信OK・rendered=comment_count列=live COUNT 一致・コメント/新規投稿の即時可視OK・fail0。→大会ベンチで 1+2 の伸び計測待ち。次は Step3(sync.Map)/Step4(session・native hash)。

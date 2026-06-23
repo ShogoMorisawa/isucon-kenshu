@@ -43,7 +43,12 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
-- 2026-06-23 15:0x 【第4R-2】comment_count 非正規化＋フィード構造の刷新（DB + index.php）。**ローカルfail0**。大会ベンチ待ち。
+- 2026-06-23 15:2x 【第4R-3】遅延セッション（session固定費削減, index.php）。大会ベンチ待ち。※今後ローカルベンチは省略（大会がfail/score両方判定）。
+  - `session_start()` を「cookieがある時のみ」に変更。匿名のcookie無しリクエストでは memcached 読み書き往復・Set-Cookie を省略。
+  - 書込経路 `POST /login`・`POST /register` 冒頭で `ensure_session()`（失敗時flashをsession保持するため）。成功時の $_SESSION 設定も同様。
+  - Flash サービスをセッション安全化: session未開始時は使い捨て配列をstorageに（Slim Flashの「Session not found」回避）。
+  - get_session_user は既にDB非依存(session値返却)。第4R-1/2: 断片HTMLキャッシュ(大会292,146→304,358), comment_count非正規化(304,358→317,479) 採用確定。
+- 2026-06-23 15:0x 【第4R-2】comment_count 非正規化＋フィード構造の刷新（DB + index.php）。大会 304,358→317,479 で**採用確定**。
   - 大会: 第4R-1 断片HTMLキャッシュは **292,146→304,358(+4%)** で採用確定。
   - DB: `posts.comment_count INT NOT NULL DEFAULT 0` 追加＋バックフィル。`db_initialize` で再集計（DELETE後に reset→GROUP BY 集計）。
   - `POST /comment`: INSERT後 `UPDATE posts SET comment_count=comment_count+1`（feed_version bump を置換）。`POST /`: bump不要に。

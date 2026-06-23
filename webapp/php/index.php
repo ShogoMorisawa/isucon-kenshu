@@ -34,7 +34,18 @@ if (isset($_SERVER['ISUCONP_MEMCACHED_ADDRESS'])) {
 ini_set('session.save_handler', 'memcached');
 ini_set('session.save_path', $memd_addr);
 
-session_start();
+// セッションは「cookieがある＝ログイン済みの可能性がある」時のみ開始する。
+// 匿名のcookie無しリクエスト(GET /等の大半)では memcached 読み書き往復・Set-Cookie をまるごと省く。
+// 書き込み経路(login/register)は ensure_session() で明示的に開始する。
+if (isset($_COOKIE[session_name()])) {
+    session_start();
+}
+
+function ensure_session() {
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        session_start();
+    }
+}
 
 // dependency
 $container = new Container();
@@ -71,7 +82,13 @@ $container->set('view', function ($c) {
 });
 
 $container->set('flash', function () {
-    return new \Slim\Flash\Messages;
+    // セッションが開始済みなら $_SESSION を、無ければ使い捨て配列を storage に使う。
+    // 遅延セッション化により匿名リクエストでは $_SESSION が無いため、Flashが「Session not found」で落ちるのを防ぐ。
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        return new \Slim\Flash\Messages();
+    }
+    $throwaway = [];
+    return new \Slim\Flash\Messages($throwaway);
 });
 
 $container->set('helper', function ($c) {
@@ -390,6 +407,8 @@ $app->get('/login', function (Request $request, Response $response) {
 });
 
 $app->post('/login', function (Request $request, Response $response) {
+    // 書き込み経路。失敗時の flash も session に残す必要があるため先にセッション開始。
+    ensure_session();
     if ($this->get('helper')->get_session_user() !== null) {
         return redirect($response, '/', 302);
     }
@@ -424,6 +443,8 @@ $app->get('/register', function (Request $request, Response $response) {
 
 
 $app->post('/register', function (Request $request, Response $response) {
+    // 書き込み経路。失敗時の flash も session に残す必要があるため先にセッション開始。
+    ensure_session();
     if ($this->get('helper')->get_session_user()) {
         return redirect($response, '/', 302);
     }
@@ -450,6 +471,7 @@ $app->post('/register', function (Request $request, Response $response) {
         $account_name,
         calculate_passhash($account_name, $password)
     ]);
+    ensure_session();
     $_SESSION['user'] = [
         'id' => $db->lastInsertId(),
         'account_name' => $account_name,

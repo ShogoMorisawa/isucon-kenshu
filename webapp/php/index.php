@@ -424,6 +424,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         $view = 'posts.php';
         require __DIR__ . '/views/layout.php';
         exit;
+    } elseif (preg_match('#^/@([^/]+)$#', $fast_path, $fm)) {
+        // GET /@{account_name} ユーザページ。存在時のみ高速描画、未存在(404)は Slim へフォールスルー。
+        $helper = $container->get('helper');
+        $account_name = rawurldecode($fm[1]);
+        $user = $helper->fetch_first('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0', $account_name);
+        if ($user !== false) {
+            $db = $helper->db();
+            $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `created_at`, `mime`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC');
+            $ps->execute([$user['id']]);
+            $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
+            $post_list_html = build_list_html($helper, $rows);
+
+            $comment_count = $helper->fetch_first('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?', $user['id'])['count'];
+
+            $ps = $db->prepare('SELECT `id` FROM `posts` WHERE `user_id` = ?');
+            $ps->execute([$user['id']]);
+            $post_ids = array_column($ps->fetchAll(PDO::FETCH_ASSOC), 'id');
+            $post_count = count($post_ids);
+
+            $commented_count = 0;
+            if ($post_count > 0) {
+                $ph = implode(',', array_fill(0, count($post_ids), '?'));
+                $commented_count = $helper->fetch_first("SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ({$ph})", ...$post_ids)['count'];
+            }
+
+            $me = $helper->get_session_user();
+            $view = 'user.php';
+            require __DIR__ . '/views/layout.php';
+            exit;
+        }
+        // ユーザ未存在は Slim 経路へ（404 共通化）
     }
 }
 

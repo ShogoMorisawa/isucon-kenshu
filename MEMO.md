@@ -43,7 +43,12 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
-- 2026-06-23 15:2x 【第4R-3】遅延セッション（session固定費削減, index.php）。大会ベンチ待ち。※今後ローカルベンチは省略（大会がfail/score両方判定）。
+- 2026-06-23 15:4x 【第4R-4】GET / の Slim バイパス高速パス（index.php）。大会ベンチ待ち。
+  - ルート定義の直前に `if (GET && REQUEST_URI==='/')` の高速パスを置き、Slim のルーティング/PSR-7生成/ミドルウェアを通さず直接処理。
+  - 処理: helper取得→posts(comment_count込)取得→build_list_html(断片キャッシュ共用)→flash→`require layout.php`→exit。
+  - テンプレ(layout→header→index→posts)・変数(me/flash/post_list_html/csrf)は通常経路と同一 → **出力HTML/Content-Typeともバイト一致を検証**（匿名/ログイン両方 diff一致, Content-Type=text/html; charset=UTF-8）。
+  - 狙い: 最頻endpoint GET / の framework固定費(Slim routing+PSR-7 object)を削減。律速のphp-fpm CPUを直撃。
+- 2026-06-23 15:2x 【第4R-3】遅延セッション（session固定費削減, index.php）。大会 317,479 から計測待ち。※今後ローカルベンチ省略（大会がfail/score両方判定）。
   - `session_start()` を「cookieがある時のみ」に変更。匿名のcookie無しリクエストでは memcached 読み書き往復・Set-Cookie を省略。
   - 書込経路 `POST /login`・`POST /register` 冒頭で `ensure_session()`（失敗時flashをsession保持するため）。成功時の $_SESSION 設定も同様。
   - Flash サービスをセッション安全化: session未開始時は使い捨て配列をstorageに（Slim Flashの「Session not found」回避）。

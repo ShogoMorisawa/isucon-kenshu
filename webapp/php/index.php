@@ -380,6 +380,23 @@ function calculate_passhash($account_name, $password) {
 
 // --------
 
+// === GET / 高速パス: Slim/PSR-7 のルーティング・オブジェクト生成・ミドルウェアを通さず直接レンダリング ===
+// 最頻endpoint GET / の固定費(framework)を削減。テンプレ(layout→header→index→posts)は通常経路と同一を使用し
+// 出力HTML・Content-Type(text/html; charset=UTF-8 = PHP既定)は通常経路とバイト一致。
+// 投稿リストは断片キャッシュ build_list_html を共用、me/csrf/flash も同じ取り回し。
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && $_SERVER['REQUEST_URI'] === '/') {
+    $helper = $container->get('helper');
+    $me = $helper->get_session_user();
+    $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 40');
+    $ps->execute();
+    $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
+    $post_list_html = build_list_html($helper, $rows);
+    $flash = $container->get('flash')->getFirstMessage('notice');
+    $view = 'index.php';
+    require __DIR__ . '/views/layout.php';
+    exit;
+}
+
 $app->get('/initialize', function (Request $request, Response $response) {
     $this->get('helper')->db_initialize();
     // DBリセットに伴い、古いフィード/詳細キャッシュを全消去（initializeは最初に呼ばれ、保持すべきセッションは無い）

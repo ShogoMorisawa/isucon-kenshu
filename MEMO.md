@@ -43,7 +43,14 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
-- 2026-06-23 14:3x 【第4R-1】投稿リストの断片HTMLキャッシュ（index.php + views/post.php,posts.php）。**ローカルfail0確認**。大会ベンチ待ち。
+- 2026-06-23 15:0x 【第4R-2】comment_count 非正規化＋フィード構造の刷新（DB + index.php）。**ローカルfail0**。大会ベンチ待ち。
+  - 大会: 第4R-1 断片HTMLキャッシュは **292,146→304,358(+4%)** で採用確定。
+  - DB: `posts.comment_count INT NOT NULL DEFAULT 0` 追加＋バックフィル。`db_initialize` で再集計（DELETE後に reset→GROUP BY 集計）。
+  - `POST /comment`: INSERT後 `UPDATE posts SET comment_count=comment_count+1`（feed_version bump を置換）。`POST /`: bump不要に。
+  - **相乗効果**: GET / /posts /@user は posts を comment_count 込みで取得し `build_list_html()` へ。断片キー `pf:{id}:c{count}` を**コメントfetch前**に算出→getMulti。**断片ヒット時はコメントクエリを一切発行しない**。ミスした投稿だけコメント(最新3)をまとめて取得。
+  - **feed_version＋index:vデータキャッシュを撤廃**: 新規投稿はcreated_at順クエリに即出現、新規コメントはcomment_count増分→断片キー変化で自動再生成＝即時可視（version不要）。
+  - make_posts は /posts/{id}(all_comments) 専用に縮小。posts.php/user.php は `$post_list_html` を echo。/initialize の cache flush は継続。
+- 2026-06-23 14:3x 【第4R-1】投稿リストの断片HTMLキャッシュ（index.php + views/post.php,posts.php）。大会 292,146→304,358(+4%) で**採用確定**。
   - ⚠️前提変更: ローカル計測はベンチ同居でCPU食合いのため数値は信用しない。fail0確認のみに使用。大会ベンチ(別マシン)が真値（直近292,146）。
   - `render_post_list($posts)`: 各投稿のpost.php出力を `pf:{id}:c{comment_count}` キーで memcached キャッシュ（getMulti/setMulti, TTL600）。
   - **自動invalidate**: コメント追加→feed_version bump→feedデータ再構築→comment_count変化→断片キーが変わり自動再生成（explicit delete不要）。

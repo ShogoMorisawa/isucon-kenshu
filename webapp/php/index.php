@@ -94,6 +94,9 @@ $container->set('helper', function ($c) {
             $sql[] = 'DELETE FROM comments WHERE id > 100000';
             $sql[] = 'UPDATE users SET del_flg = 0';
             $sql[] = 'UPDATE users SET del_flg = 1 WHERE id % 50 = 0';
+            // comment_count 非正規化列を再集計（DELETE後の残データに合わせる）
+            $sql[] = 'UPDATE posts SET comment_count = 0';
+            $sql[] = 'UPDATE posts p JOIN (SELECT post_id, COUNT(*) c FROM comments GROUP BY post_id) x ON p.id = x.post_id SET p.comment_count = x.c';
             foreach($sql as $s) {
                 $db->query($s);
             }
@@ -248,25 +251,6 @@ function feed_cache() {
     return $mc;
 }
 
-// フィードのグローバルバージョン。投稿/コメント追加で bump し、古いキャッシュキーを参照させない。
-function feed_version() {
-    $mc = feed_cache();
-    $v = $mc->get('feed_version');
-    if ($v === false) {
-        $mc->add('feed_version', 1);
-        $v = $mc->get('feed_version');
-        $v = ($v === false) ? 1 : $v;
-    }
-    return $v;
-}
-function bump_feed_version() {
-    $mc = feed_cache();
-    if ($mc->increment('feed_version', 1) === false) {
-        $mc->add('feed_version', 1);
-        $mc->increment('feed_version', 1);
-    }
-}
-
 // csrf_token はユーザ固有なので断片HTMLにはプレースホルダを埋め、最後に実トークンへ置換する
 const CSRF_PLACEHOLDER = '@@CSRFTOKEN@@';
 
@@ -279,34 +263,79 @@ function render_one_post_fragment(array $post) {
 }
 
 // 投稿リストのHTMLを断片キャッシュで組み立てる。
-// 断片キーは (post_id, comment_count)。コメント追加で comment_count が変わり自動的に別キー＝自動invalidate。
-// 投稿本文/画像/ユーザ名/最新3コメントは全ユーザ共通なので断片はユーザ間で再利用でき、csrfだけ後段で合成する。
-function render_post_list(array $posts) {
+// $rows: posts の生行（id,user_id,body,mime,created_at,comment_count を含む。commentsは未取得でよい）。
+// 断片キーは (post_id, comment_count)。comment_count(非正規化列)はクエリで取得済なので、
+// **断片がヒットすればコメントを一切fetchしない**。コメント追加で comment_count が変わり自動invalidate。
+// csrf はプレースホルダで描画し最後に実トークンへ合成（断片を全ユーザで共有）。
+function build_list_html($helper, array $rows) {
     $mc = feed_cache();
+    // del_flg=0 の投稿を最大 POSTS_PER_PAGE 件選ぶ（user は一括取得）
+    $user_cache = [];
+    $helper->preload_users(array_map(fn($p) => $p['user_id'], $rows), $user_cache);
+    $selected = [];
+    foreach ($rows as $p) {
+        $u = $user_cache[$p['user_id']] ?? null;
+        if ($u && $u['del_flg'] == 0) {
+            $p['user'] = $u;
+            $selected[] = $p;
+            if (count($selected) >= POSTS_PER_PAGE) {
+                break;
+            }
+        }
+    }
+    if (!$selected) {
+        return '';
+    }
+
+    // 断片キャッシュを comment_count キーで一括引き
     $keys = [];
-    foreach ($posts as $p) {
+    foreach ($selected as $p) {
         $keys[$p['id']] = 'pf:' . (int)$p['id'] . ':c' . (int)($p['comment_count'] ?? 0);
     }
-    $found = $keys ? $mc->getMulti(array_values($keys)) : [];
+    $found = $mc->getMulti(array_values($keys));
     if ($found === false) {
         $found = [];
     }
+
+    // ヒットしなかった投稿だけ、コメント(最新3件)とそのユーザをまとめて取得
+    $miss_ids = [];
+    foreach ($selected as $p) {
+        if (!isset($found[$keys[$p['id']]])) {
+            $miss_ids[] = $p['id'];
+        }
+    }
+    $comments_by_post = [];
+    if ($miss_ids) {
+        $ph = implode(',', array_fill(0, count($miss_ids), '?'));
+        $ps = $helper->db()->prepare("SELECT `id`,`post_id`,`user_id`,`comment`,`created_at` FROM `comments` WHERE `post_id` IN ({$ph}) ORDER BY `created_at` DESC");
+        $ps->execute($miss_ids);
+        $all = $ps->fetchAll(PDO::FETCH_ASSOC);
+        $helper->preload_users(array_map(fn($c) => $c['user_id'], $all), $user_cache);
+        foreach ($all as $c) {
+            $pid = $c['post_id'];
+            if (count($comments_by_post[$pid] ?? []) < 3) {
+                $c['user'] = $user_cache[$c['user_id']] ?? null;
+                $comments_by_post[$pid][] = $c;
+            }
+        }
+    }
+
     $html = '';
     $to_set = [];
-    foreach ($posts as $p) {
+    foreach ($selected as $p) {
         $k = $keys[$p['id']];
         if (isset($found[$k])) {
             $html .= $found[$k];
-        } else {
-            $frag = render_one_post_fragment($p);
-            $to_set[$k] = $frag;
-            $html .= $frag;
+            continue;
         }
+        $p['comments'] = array_reverse($comments_by_post[$p['id']] ?? []);
+        $frag = render_one_post_fragment($p);
+        $to_set[$k] = $frag;
+        $html .= $frag;
     }
     if ($to_set) {
         $mc->setMulti($to_set, 600);
     }
-    // ユーザ固有の csrf を最後に1回だけ合成
     return str_replace(CSRF_PLACEHOLDER, escape_html($_SESSION['csrf_token'] ?? ''), $html);
 }
 
@@ -439,24 +468,16 @@ $app->get('/logout', function (Request $request, Response $response) {
 $app->get('/', function (Request $request, Response $response) {
     $me = $this->get('helper')->get_session_user();
 
-    // フィード($posts)は全ユーザ共通。memcachedにキャッシュし、投稿/コメント時のfeed_versionバンプで無効化。
-    // me/csrf/flash はキャッシュ外でテンプレ合成するのでユーザ別表示は保たれる。
-    // ※匿名フルHTMLキャッシュも試したが効果無し(GET /は大半が認証済トラフィックでanon cacheがヒットしない)→不採用。
-    $mc = feed_cache();
-    $ckey = 'index:v' . feed_version();
-    $posts = $mc->get($ckey);
-    if ($posts === false) {
-        $db = $this->get('db');
-        // idx_created_at の逆順読みでfilesort回避。del_flg除外はmake_posts内。母数をLIMITで制限(削除ユーザ~2%なので40で20件は確実)
-        $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 40');
-        $ps->execute();
-        $results = $ps->fetchAll(PDO::FETCH_ASSOC);
-        $posts = $this->get('helper')->make_posts($results);
-        $mc->set($ckey, $posts, 10);
-    }
+    // comment_count(非正規化列)込みで posts を取得 → build_list_html が断片ヒット時はコメントをfetchしない。
+    // 新規投稿/コメントはこのクエリ結果(created_at順 / comment_count)に即反映されるので version不要・即時可視。
+    $db = $this->get('db');
+    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 40');
+    $ps->execute();
+    $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
+    $list_html = build_list_html($this->get('helper'), $rows);
 
     return $this->get('view')->render($response, 'index.php', [
-        'posts' => $posts,
+        'post_list_html' => $list_html,
         'me' => $me,
         'flash' => $this->get('flash')->getFirstMessage('notice'),
     ]);
@@ -465,14 +486,13 @@ $app->get('/', function (Request $request, Response $response) {
 $app->get('/posts', function (Request $request, Response $response) {
     $params = $request->getQueryParams();
     $max_created_at = $params['max_created_at'] ?? null;
-    // ※/posts キャッシュは低頻度＋max_created_at別でヒット率低く効果無し(stage計測で~188k<192k)のため未キャッシュ
     $db = $this->get('db');
-    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40');
+    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40');
     $ps->execute([$max_created_at === null ? null : $max_created_at]);
-    $results = $ps->fetchAll(PDO::FETCH_ASSOC);
-    $posts = $this->get('helper')->make_posts($results);
+    $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
+    $list_html = build_list_html($this->get('helper'), $rows);
 
-    return $this->get('view')->render($response, 'posts.php', ['posts' => $posts]);
+    return $this->get('view')->render($response, 'posts.php', ['post_list_html' => $list_html]);
 });
 
 $app->get('/posts/{id}', function (Request $request, Response $response, $args) {
@@ -545,8 +565,8 @@ $app->post('/', function (Request $request, Response $response) {
             $imgdir = dirname(__DIR__) . '/public/image';
             file_put_contents("{$imgdir}/{$pid}.{$ext}", $data);
         }
-        // 新規投稿はフィード先頭に出る → キャッシュ無効化
-        bump_feed_version();
+        // 新規投稿は created_at 順クエリに即座に出現し、断片キー pf:{id}:c0 は未生成=即レンダリングされる
+        // （feed_version 不要・即時可視）。
         return redirect($response, "/posts/{$pid}", 302);
     } else {
         $this->get('flash')->addMessage('notice', '画像が必須です');
@@ -599,8 +619,9 @@ $app->post('/comment', function (Request $request, Response $response) {
         $params['comment']
     ]);
 
-    // コメント追加でフィードのコメント数/最新3件が変わる → キャッシュ無効化
-    bump_feed_version();
+    // 非正規化列を増分更新。これにより断片キー pf:{id}:c{count} が変わり、当該投稿の断片が自動再生成される（即時可視）
+    $up = $this->get('db')->prepare('UPDATE `posts` SET `comment_count` = `comment_count` + 1 WHERE `id` = ?');
+    $up->execute([$post_id]);
 
     return redirect($response, "/posts/{$post_id}", 302);
 });
@@ -662,10 +683,10 @@ $app->get('/@{account_name}', function (Request $request, Response $response, $a
         return $response->withStatus(404);
     }
 
-    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC');
+    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `created_at`, `mime`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC');
     $ps->execute([$user['id']]);
-    $results = $ps->fetchAll(PDO::FETCH_ASSOC);
-    $posts = $this->get('helper')->make_posts($results);
+    $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
+    $list_html = build_list_html($this->get('helper'), $rows);
 
     $comment_count = $this->get('helper')->fetch_first('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?', $user['id'])['count'];
 
@@ -682,7 +703,7 @@ $app->get('/@{account_name}', function (Request $request, Response $response, $a
 
     $me = $this->get('helper')->get_session_user();
 
-    return $this->get('view')->render($response, 'user.php', ['posts' => $posts, 'user' => $user, 'post_count' => $post_count, 'comment_count' => $comment_count, 'commented_count'=> $commented_count, 'me' => $me]);
+    return $this->get('view')->render($response, 'user.php', ['post_list_html' => $list_html, 'user' => $user, 'post_count' => $post_count, 'comment_count' => $comment_count, 'commented_count'=> $commented_count, 'me' => $me]);
 });
 
 $app->run();

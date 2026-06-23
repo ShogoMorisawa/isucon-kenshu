@@ -208,3 +208,17 @@ cd /home/isucon/private_isu/benchmarker
 - DB接続: env.sh の ISUCONP_DB_USER=isuconp / PASSWORD=isuconp / NAME=isuconp。host=localhost, port=3306。
 - DB件数(初期): posts=10004。テーブル: users, posts, comments。
 - 他言語サービス(go/node/python)は disabled。Rubyは disabled 済み。
+
+---
+## 🌿 go-port ブランチ（実験: Go移植, main=php-best-392k は不可侵）
+- main にタグ `php-best-392k`（大会392,566）。Goが超えなければ `git checkout main` + `./use-php.sh` で確実に戻る。
+- **切り替え3点セット**（コード=git, サービス=systemctl, nginx=向き先）:
+  - Go へ: `git checkout go-port && (cd webapp/golang && go build -o app) && ./use-go.sh`
+  - PHP へ: `git checkout main && ./use-php.sh`
+  - use-go.sh / use-php.sh が nginx設定(isucon.conf.go/.php)切替＋サービス起動/停止/enable を実施。
+  - DBの idx_feed・comment_count列、nginxの画像/静的/immutable は両実装共通（切替不要）。
+- nginx設定の実体: /etc/nginx/sites-available/ に isucon.conf.go(Go), isucon.conf.php(PHP最良), isucon.conf(=現用) を保存。
+- ⚠️ システム依存（共通）: php8.3-apcu, idx_feed索引, comment_count列。
+### 第5R-1【切替+可逆性】stock Go 起動。fail0(ローカル19885, 最適化前). 
+- app.go の Post 構造体に `db:"comment_count"` タグ追加（schema変更でSELECT *がsqlx mapエラーになるのを修正）。
+- 可逆性確認: PHP⇄Go 切替OK、isu-go enabled(再起動耐性)。→大会ベンチで Go 初期スコア計測待ち。

@@ -23,6 +23,7 @@
 | 2026-06-23 13:1x | 166-170k (A/B複数回) | 【仕上げ7】opcache本番化をA/B。JIT(tracing)+validate_timestamps=0=166.0/166.8k、vt=0のみ=169.3k、default=165.9/170.0k。**全て±2.5%の変動幅内で有意差なし**。JITは僅かに不利寄り。footgun(vt=0はコード変更後restart必須)回避のため**defaultへ revert**。スコア確定値は ~170k(169984)とみなす |
 | 2026-06-23 13:15 | **170284 / 169319** (pass, fail0/2回) | 【性能1】get_session_user のDB SELECT撤廃→session(memcached)のid/account_name/authorityを返す。score変動幅内(baseline169984比±0)だが**mysqld CPU(39%)を全認証リクエストから1往復削減**＋step4の土台。零リスク・全員一致で採用 |
 | 2026-06-23 13:18 | 166597 / 167404 (pass, fail0/2回) | 【性能2】画像 `Cache-Control: public, max-age=31536000, immutable`、Cache-Control重複(public/max-age 2本)を解消。score変動内(既存1d max-ageで既にテスト窓全体キャッシュ済のため伸びず)。重複ヘッダ修正＋immutableは意味的に正しく零リスクのため採用 |
+| 2026-06-23 13:25 | **181596 / 182627** (pass, fail0/2回) | 【性能3a】server に `gzip off`（HTML非圧縮）。loopbackで圧縮の帯域メリット無し、nginx圧縮CPU+bench解凍CPU(計測bench60%)の二重浪費を排除。~170k→~182k(**+7%, 変動超で確実**)。採用 |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。
@@ -37,6 +38,9 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 13:25 【性能3a】HTML gzip無効化（isucon.conf, server に `gzip off;`）。score ~170k→~182k(+7%)。
+  - loopbackベンチでは圧縮の帯域利益が無く、nginx圧縮+benchmarker解凍が同2コアを二重に食う純損失だった（計測でbench=60%CPU）。
+  - 注: `gzip off` を location ~ \.php に置くと try_files内部redirectで効かず、server直下に置く必要があった。css/js/svgも非圧縮になるが小容量・低頻度で影響軽微。nginx.conf側の `gzip on`/gzip_types は残置（このserverでoff上書き）。
 - 2026-06-23 13:18 【性能2】画像Cache-Control最適化（isucon.conf）。score変動内・ヘッダ正規化。
   - location分割: `\.(jpg|jpeg|png|gif)$`→`add_header Cache-Control "public, max-age=31536000, immutable"`（expires撤去で重複解消）。
   - `\.(css|js|ico|svg)$`→`public, max-age=86400`。bak: isucon.conf.bak2

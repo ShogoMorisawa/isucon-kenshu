@@ -47,6 +47,7 @@ cd /home/isucon/private_isu/benchmarker
   - 無効化: `POST /`(新規投稿) と `POST /comment`(コメント) で `bump_feed_version()`。→ 次GET /は新keyで再構築し**投稿/コメント即時反映**(ベンチfail0)。
   - `/initialize` で `feed_cache()->flush()`（DBリセットと同時に古いキャッシュ全消去。最初の呼出で保持すべきセッション無し）。
   - ※GET /posts/{id} のデータ構造キャッシュは stage1 で -2.7% のため不採用（元々安価なクエリ）。
+  - ※GET /posts キャッシュも追加検証(~188k<192k)→低頻度＋max_created_at別でヒット率低く効果無く revert。GET / のみ採用。
 - 2026-06-23 13:25 【性能3a】HTML gzip無効化（isucon.conf, server に `gzip off;`）。score ~170k→~182k(+7%)。
   - loopbackベンチでは圧縮の帯域利益が無く、nginx圧縮+benchmarker解凍が同2コアを二重に食う純損失だった（計測でbench=60%CPU）。
   - 注: `gzip off` を location ~ \.php に置くと try_files内部redirectで効かず、server直下に置く必要があった。css/js/svgも非圧縮になるが小容量・低頻度で影響軽微。nginx.conf側の `gzip on`/gzip_types は残置（このserverでoff上書き）。

@@ -421,6 +421,7 @@ $app->get('/', function (Request $request, Response $response) {
 $app->get('/posts', function (Request $request, Response $response) {
     $params = $request->getQueryParams();
     $max_created_at = $params['max_created_at'] ?? null;
+    // ※/posts キャッシュは低頻度＋max_created_at別でヒット率低く効果無し(stage計測で~188k<192k)のため未キャッシュ
     $db = $this->get('db');
     $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 100');
     $ps->execute([$max_created_at === null ? null : $max_created_at]);

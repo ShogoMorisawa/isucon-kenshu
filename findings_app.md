@@ -258,3 +258,20 @@
 6. **⑥ flash遅延化・列削減等の細かな固定費**（軽微・低リスク・積み増し）。
 
 50万チームの大技推測（アプリ側）: (a)**プロセス内(APCu/OPcache preload)で完結させ、memcached/DBへの同期往復を最頻パスからほぼ消す**、(b)Slim等フレームワーク生成を完全に回避した薄いフロントコントローラ、(c)リスト/詳細をHTML断片で持ちテンプレ実行を実質ゼロに、の徹底。**律速がphp-fpm CPUなので、残る勝負は「1リクエストのPHP命令数とブロッキングI/O回数をどこまで0に近づけるか」**。本ラウンドの①②③が直撃ターゲット。要 findings_infra.md（APCu導入・preload・fpm worker配分）と突き合わせ。
+
+## [16:3x 第4R-補] Go言語移植の是非（律速がphp-fpm CPUなので「効く方向」だが大博打）
+(1)現象/前提: 律速は php-fpm CPU=80%（PHPインタプリタ実行＋リクエスト毎bootstrap）。リポジトリに Go実装あり（`webapp/golang/app.go`, ビルド済`app`, `isu-go.service`=disabled）が**完全に素のリファレンス**＝画像DB BLOB配信(`getImage`が`post.Imgdata`を返す)・makPostsがper-post COUNT+コメントN+1・FORCE INDEX無し・アプリ内キャッシュ無し。
+(2)なぜGoが速くなりうるか（方向性は正しい）:
+  - **リクエスト毎bootstrapが消える**: PHPは毎回 autoload＋Container＋(AppFactory)＋opcode実行。Goは常駐プロセスで固定費ほぼ0。今の第4R-②④で削ろうとしている固定費が構造的にゼロになる。
+  - **アプリ内キャッシュが無料**: 第4R-①でAPCu化を狙っている「memcached往復の排除」は、Goなら `sync.Map`/mapで**ネットワーク往復もシリアライズも無し**＝ネイティブ。これが律速のphp-fpm CPUを直撃する核心。
+  - **コンパイル済＋goroutine＋DBコネクションプール**で同一処理あたりCPUサイクルが大幅に小さい。private-isu高得点帯は実際Goが定番。
+  → **CPUが唯一の壁である以上、同じアルゴリズムをGoで実装すれば天井は確実に上がる**（500k超も射程）。
+(3)ただしリスク/コスト（重要）:
+  - リポジトリのGoは**未最適化ベースライン**。素のまま切替えると「PHP切替直後＋BLOB配信」相当へ一旦**大幅後退**する。369kを超えるには全最適化の再移植が必要。
+  - 救い: **DB側資産(index4本・comment_count列)とnginx側資産(画像静的ファイル・immutable cache・gzip off)・MySQL/fpm設定は言語非依存でそのまま流用可能**。再実装が要るのは app.go のロジックのみ（posts LIMIT40+FORCE INDEX、コメント/ユーザのIN一括、ban集合、投稿リストのインメモリ断片キャッシュ、画像はファイル書出し＆nginx直配信）。
+  - レスポンスHTMLのバイト一致再達成とfail0再検証に相応の工数。テンプレ(`golang/templates`)はPHP views と別物。
+(4)推奨アクション（意思決定）:
+  - **残り時間が十分あるなら Go移植が最高天井**。手順: ①isu-go用にDB/nginx資産はそのまま、②app.goへ既存PHP最適化を移植（特にインメモリ断片キャッシュ＝APCu相当をmapで）、③コンテストベンチで PHP現行369k と A/B、④下回れば即 php-fpm へ戻す（両service togglableなので可逆）。
+  - **残り時間が少ない／確実性重視なら**、第4R-①②③（APCu化＋bootstrap削減＋ban集合）でPHPを詰める方が低リスク。これだけでも ~450-500k は狙える可能性。
+  - 中間案: まず②(零リスク)と③をPHPで入れて確実に積み、並行してGoプロトタイプを別端末で検証→コンテストベンチで上回ったら切替。
+(5)根拠: 律速＝PHPインタプリタCPU。Goは「per-request bootstrap」「memcached往復」「フレームワーク生成」という第4Rで削ろうとしている固定費を**構造的に全部ゼロ化**する。方向は完全に正しいが、未最適化ベースラインからの再移植コストと可逆性をどう見るかの経営判断。要 MEMO（実装係の残時間/工数感）と突き合わせ。

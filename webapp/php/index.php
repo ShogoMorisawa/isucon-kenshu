@@ -455,6 +455,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             exit;
         }
         // ユーザ未存在は Slim 経路へ（404 共通化）
+    } elseif (preg_match('#^/image/(\d+)\.(\w+)$#', $fast_path, $fm)) {
+        // GET /image フォールバック。通常画像はnginxが直配信するため、ここに来るのはファイル未存在(=404)が大半。
+        // id==0 の特殊応答(空200)は元実装に委ねるため Slim へフォールスルー。
+        $iid = (int)$fm[1];
+        if ($iid !== 0) {
+            $ext = $fm[2];
+            $mime = ['jpg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif'][$ext] ?? '';
+            $path = dirname(__DIR__) . "/public/image/{$iid}.{$ext}";
+            if ($mime !== '' && is_file($path)) {
+                header("Content-Type: {$mime}");
+                readfile($path);
+                exit;
+            }
+            http_response_code(404);
+            echo '404';
+            exit;
+        }
+        // id==0 は Slim 経路へ
     }
 }
 

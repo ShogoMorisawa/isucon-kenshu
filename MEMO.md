@@ -43,7 +43,15 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
-- 2026-06-23 15:4x 【第4R-4】GET / の Slim バイパス高速パス（index.php）。大会ベンチ待ち。
+- 2026-06-23 16:0x 【第4R-5】Slimバイパス横展開（index.php, 高速パスdispatcher）。endpoint毎に別commit。大会ベンチ待ち。
+  - dispatcher: `parse_url(REQUEST_URI,PATH)` で分岐。該当しない/404は exit せず Slim へフォールスルー（404応答を共通化）。
+  - 5a `GET /posts/{id}`(06b19be): 投稿詳細。存在時のみ高速、未存在はフォールスルー。anon/li バイト一致。
+  - 5b `GET /posts`(7f34a66): ページング。Slim経路同様 `me` を渡さない(ヘッダ常にログインリンク)。バイト一致＋paging確認。
+  - 5c `GET /@user`(c763558): ユーザページ。存在時のみ高速、未存在フォールスルー。anon/li バイト一致。
+  - 5d `GET /image`(下記commit): フォールバック。nginxが実ファイル直配信するためPHP到達は未存在(404)が大半。id==0はフォールスルー。404応答一致。
+  - 全て fast-path 出力 = Slim経路出力 を diff で **バイト一致**確認済（匿名/ログイン）。
+  - 大会: 第4R-4 GET / バイパス 317,479→**348,797(+10%, 過去最大)** で採用確定。
+- 2026-06-23 15:4x 【第4R-4】GET / の Slim バイパス高速パス（index.php）。大会 317,479→348,797(+10%) で**採用確定**。
   - ルート定義の直前に `if (GET && REQUEST_URI==='/')` の高速パスを置き、Slim のルーティング/PSR-7生成/ミドルウェアを通さず直接処理。
   - 処理: helper取得→posts(comment_count込)取得→build_list_html(断片キャッシュ共用)→flash→`require layout.php`→exit。
   - テンプレ(layout→header→index→posts)・変数(me/flash/post_list_html/csrf)は通常経路と同一 → **出力HTML/Content-Typeともバイト一致を検証**（匿名/ログイン両方 diff一致, Content-Type=text/html; charset=UTF-8）。

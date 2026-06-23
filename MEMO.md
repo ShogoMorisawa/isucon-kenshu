@@ -244,3 +244,10 @@ cd /home/isucon/private_isu/benchmarker
 - 犯人2(テンプレ毎回パース): 全テンプレを cachedTmpl(sync.Map)で起動後1回だけParse。毎リクエストのディスクread/パースを排除。
 - 断片キャッシュ eviction: fragStore で件数上限(50000)超で全消去（無制限増加→GC劣化を防止）。
 - 検証: 全ページ200・fail0安定(2回, ~275k)・comment_count一致・即時可視維持。→大会ベンチで 392k 超え確認。超えれば go-port を main に merge。
+
+---
+## 🏁 最終結果: Go 正式採用（main に merge 済 / 2026-06-23）
+- 大会スコア推移: PHP 532→...→**392,566(php-best-392k)** → Go移植 26,845→186,331→**479,617**（PHP比+22%）。
+- main = Go実装。`git checkout main` の現用が Go。切り戻し: `git checkout php-best-392k && ./use-php.sh`（PHP 392k）。
+- 共通基盤（両実装で流用）: idx_feed索引・comment_count列・nginx画像/静的/immutable/gzip off・MySQL(binlog無効/buffer512M/max_conn512)・php8.3-apcu。
+- システム依存（再構築時の再適用）: MySQL my.cnf(disable-log-bin, flush=2, buffer_pool, max_connections, thread_cache), idx_feed, comment_count列, (PHP戻す場合のみ php8.3-apcu)。

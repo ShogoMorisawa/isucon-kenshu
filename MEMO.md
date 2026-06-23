@@ -20,6 +20,7 @@
 | 2026-06-23 12:4x | **160239** (pass, success152052/**fail0**) | 【性能4】make_postsのN+1一括化。per-post COUNT+comments(40往復)→comments 1クエリ(IN, DESC)で取得し件数もPHPで算出、user取得もpreload_users(IN)で一括。96704→160239(+66%)。レンダリング件数/コメント数をDBと突合し一致確認。採用 |
 | 2026-06-23 12:5x | **168597** (pass, success160084/**fail0**) | 【性能5】PDO `ATTR_PERSISTENT=>true`。接続確立コスト削減。160239→168597(+5%)。max_connections=151に対し常駐~16で安全。採用 |
 | 2026-06-23 13:0x | **169984** (pass, success161353/**fail0**) | 【仕上げ6】csrf_token警告抑制。views(post/index/banned).phpの `$_SESSION['csrf_token']`→`?? ''`。168597→169984(+0.8%,変動内)だがerror.log肥大(32MB)を停止。採用 |
+| 2026-06-23 13:1x | 166-170k (A/B複数回) | 【仕上げ7】opcache本番化をA/B。JIT(tracing)+validate_timestamps=0=166.0/166.8k、vt=0のみ=169.3k、default=165.9/170.0k。**全て±2.5%の変動幅内で有意差なし**。JITは僅かに不利寄り。footgun(vt=0はコード変更後restart必須)回避のため**defaultへ revert**。スコア確定値は ~170k(169984)とみなす |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。
@@ -34,6 +35,9 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 13:1x 【仕上げ7・不採用】opcache JIT/validate_timestamps=0 を A/B 検証→**default へ revert**。
+  - 結果は全て±2.5%変動幅内で有意差なし。JITはむしろ僅かに不利。`/etc/php/8.3/fpm/conf.d/99-opcache-tuning.ini` は削除済（default: opcache On / validate_timestamps On / JIT off）。
+  - 📐 教訓: **このベンチは±2.5%の変動がある**。1〜2回の差(数千点)では効果と判定しない。明確な効果は同方向で複数回・変動幅超のときのみ採用。
 - 2026-06-23 13:0x 【仕上げ6】csrf_token警告抑制（views 3ファイル）。error.log肥大停止。score 168597→169984。
   - post.php/index.php/banned.php の `escape_html($_SESSION['csrf_token'])`→`... ?? ''`。匿名ユーザでも警告を出さない。ログイン時の出力は不変。
 - 2026-06-23 12:5x 【性能5】PDO永続接続。score 160239→168597(+5%)。
@@ -87,15 +91,16 @@ cd /home/isucon/private_isu/benchmarker
   - 動作確認: / 200, /login 200, /css/style.css 200, /image/1.jpg 200(image/jpeg)。
 
 ## 🔧 いま作業中（実装係が宣言）
-- なし（①〜⑤完了。532→81758, fail0）
-- 2026-06-23 12:1x git管理開始（初回コミット完了、スコア81758）。.gitignore で画像生成物/vendor/node_modules/.venv/userdata/bin/*.log/*.bak 等を除外し .git=1.2M。以降は各ステップのベンチ後に `git commit`（メッセージに施策名+スコア）運用。
+- なし。第2ラウンド（保全1-2＋性能3-5＋仕上げ6-7）完了。**532→約170,000（fail0）**。git管理運用中(各ステップcommit)。
+- ✅ ディスク危機 解消: 96%(681MB)→**76%(3.6GB空き)**（binlog無効化1.8GB + imgdata削除1.2GB）。
 
 ## ⏭️ 次の候補（未着手・効果見込み順）
-- digest() の openssl 外部プロセス起動を PHP の hash('sha512') ネイティブ化（login多シナリオ／findings_app ⑤）。出力フォーマット互換に注意。
-- POST / で imgdata を DB にも保存し続けている → DB INSERT から imgdata を外す（ファイルのみ）検討。ただし /image フォールバックがDB依存なので要設計。
-- comment_count の per-post COUNT を GROUP BY 一括 or postsに集計列。
-- php-fpm max_children のさらなる調整（ベンチ中 top で CPU/worker飽和を観測してから）。
-- ⚠️ ディスク残 ~1GB（94%）。ベンチ毎に画像ファイル+DB imgdata が増える。逼迫したら public/image の id>10000 や DBの不要blobを整理。
+- 【DB提案③】getAccountName(/@user) が posts WHERE user_id を2回投げている→L519結果を流用しL526削除（低コスト）。
+- 【App提案⑤】get_session_user の `SELECT *`→必要カラム限定（全ホットパスに1往復、効果中の下）。
+- POST /comment で posts.comment_count 集計列を持たせCOUNT自体を消す案（性能4でper-post COUNTは既に解消済なので優先度低）。
+- php-fpm max_children / CPU配分: ベンチ中 `top` で php-fpm と mysqld のCPU%を観測。CPU2コア飽和なら worker増は無効。
+- ⚠️ ベンチ変動幅±2.5%。効果判定は同方向・複数回・変動超のときのみ。
+- 🧹 public/image に id>10000 のゴミ画像が累積（initializeで掃除せず）。ディスク再逼迫時に整理。
 
 ## 📥 調査係からの提案 採否
 - findings_db.md / findings_app.md / findings_infra.md を参照し、採用したものをここに記録

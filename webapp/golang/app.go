@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	crand "crypto/rand"
+	"crypto/sha512"
+	"encoding/hex"
 	"fmt"
 	"html/template"
 	"io"
@@ -10,11 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -56,6 +58,7 @@ type Post struct {
 	Comments     []Comment
 	User         User
 	CSRFToken    string
+	Rendered     template.HTML // 断片キャッシュ済みHTML（posts.html はこれを出力）
 }
 
 type Comment struct {
@@ -115,22 +118,10 @@ func validateUser(accountName, password string) bool {
 		regexp.MustCompile(`\A[0-9a-zA-Z_]{6,}\z`).MatchString(password)
 }
 
-// 今回のGo実装では言語側のエスケープの仕組みが使えないのでOSコマンドインジェクション対策できない
-// 取り急ぎPHPのescapeshellarg関数を参考に自前で実装
-// cf: http://jp2.php.net/manual/ja/function.escapeshellarg.php
-func escapeshellarg(arg string) string {
-	return "'" + strings.Replace(arg, "'", "'\\''", -1) + "'"
-}
-
 func digest(ctx context.Context, src string) string {
-	// opensslのバージョンによっては (stdin)= というのがつくので取る
-	out, err := exec.CommandContext(ctx, "/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
-	if err != nil {
-		log.Print(err)
-		return ""
-	}
-
-	return strings.TrimSuffix(string(out), "\n")
+	// openssl外部プロセス起動を排除し crypto/sha512 でネイティブ計算（バイト互換確認済）。
+	sum := sha512.Sum512([]byte(src))
+	return hex.EncodeToString(sum[:])
 }
 
 func calculateSalt(ctx context.Context, accountName string) string {
@@ -155,14 +146,17 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	u := User{}
-
-	err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", uid)
-	if err != nil {
+	// userCache(sync.Map) 経由でDB往復を排除（初回のみDB）
+	var id int
+	switch v := uid.(type) {
+	case int:
+		id = v
+	case int64:
+		id = int(v)
+	default:
 		return User{}
 	}
-
-	return u
+	return getUserByID(ctx, id)
 }
 
 func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
@@ -178,32 +172,203 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
-// 指定id群のユーザを1クエリ(IN)でまとめて取得（dedup）。Step3でsync.Mapキャッシュ化予定。
+// ===== インメモリキャッシュ（プロセス内・往復ゼロ。Goの構造的優位） =====
+const csrfPlaceholder = "@@CSRFTOKEN@@"
+
+var (
+	fragmentCache sync.Map // string(pf:{id}:c{count}) -> string (csrfプレースホルダ入り断片HTML)
+	userCache     sync.Map // int(user id) -> User
+	bannedMu      sync.RWMutex
+	bannedSet     map[int]bool // del_flg=1 のid集合（nil=未ロード）
+	postFragTmpl  *template.Template
+	postFragOnce  sync.Once
+)
+
+func clearAppCaches() {
+	fragmentCache.Clear()
+	userCache.Clear()
+	bannedMu.Lock()
+	bannedSet = nil
+	bannedMu.Unlock()
+}
+
+// del_flg=1 のID集合（フィード選別用）。変化は register(無関係) / admin/banned / initialize のみ。
+func getBannedSet(ctx context.Context) map[int]bool {
+	bannedMu.RLock()
+	if bannedSet != nil {
+		m := bannedSet
+		bannedMu.RUnlock()
+		return m
+	}
+	bannedMu.RUnlock()
+	bannedMu.Lock()
+	defer bannedMu.Unlock()
+	if bannedSet != nil {
+		return bannedSet
+	}
+	var ids []int
+	if err := db.SelectContext(ctx, &ids, "SELECT `id` FROM `users` WHERE `del_flg` = 1"); err != nil {
+		log.Print(err)
+		return map[int]bool{}
+	}
+	m := make(map[int]bool, len(ids))
+	for _, id := range ids {
+		m[id] = true
+	}
+	bannedSet = m
+	return m
+}
+
+// id→User を sync.Map キャッシュ（毎回の SELECT users を排除）。
 func getUsersByIDs(ctx context.Context, ids []int) (map[int]User, error) {
 	result := map[int]User{}
 	if len(ids) == 0 {
 		return result, nil
 	}
 	seen := map[int]bool{}
-	uniq := make([]int, 0, len(ids))
+	missing := make([]int, 0, len(ids))
 	for _, id := range ids {
-		if !seen[id] {
-			seen[id] = true
-			uniq = append(uniq, id)
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if v, ok := userCache.Load(id); ok {
+			result[id] = v.(User)
+		} else {
+			missing = append(missing, id)
 		}
 	}
-	query, args, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", uniq)
-	if err != nil {
-		return nil, err
-	}
-	var users []User
-	if err := db.SelectContext(ctx, &users, db.Rebind(query), args...); err != nil {
-		return nil, err
-	}
-	for _, u := range users {
-		result[u.ID] = u
+	if len(missing) > 0 {
+		query, args, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", missing)
+		if err != nil {
+			return nil, err
+		}
+		var users []User
+		if err := db.SelectContext(ctx, &users, db.Rebind(query), args...); err != nil {
+			return nil, err
+		}
+		for _, u := range users {
+			result[u.ID] = u
+			userCache.Store(u.ID, u)
+		}
 	}
 	return result, nil
+}
+
+func getUserByID(ctx context.Context, id int) User {
+	if v, ok := userCache.Load(id); ok {
+		return v.(User)
+	}
+	u := User{}
+	if err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", id); err != nil || u.ID == 0 {
+		return User{}
+	}
+	userCache.Store(id, u)
+	return u
+}
+
+// 1投稿分の post.html を文字列レンダリング（csrfはプレースホルダ）。
+func renderFragment(p Post) string {
+	postFragOnce.Do(func() {
+		postFragTmpl = template.Must(template.New("post.html").Funcs(template.FuncMap{"imageURL": imageURL}).ParseFiles(getTemplPath("post.html")))
+	})
+	var buf strings.Builder
+	if err := postFragTmpl.Execute(&buf, p); err != nil {
+		log.Print(err)
+	}
+	return buf.String()
+}
+
+// 投稿リストを断片キャッシュで構築。各 Post.Rendered に csrf 合成済みHTMLをセット。
+// rows は軽量行(id,user_id,comment_count)で可。断片ヒット時は本体/コメント/ユーザを一切fetchしない。
+func buildListPosts(ctx context.Context, rows []Post, csrf string) ([]Post, error) {
+	banned := getBannedSet(ctx)
+	selected := make([]Post, 0, postsPerPage)
+	for _, p := range rows {
+		if !banned[p.UserID] {
+			selected = append(selected, p)
+			if len(selected) >= postsPerPage {
+				break
+			}
+		}
+	}
+	if len(selected) == 0 {
+		return []Post{}, nil
+	}
+
+	out := make([]Post, len(selected))
+	keys := make([]string, len(selected))
+	missIdx := []int{}
+	for i, p := range selected {
+		keys[i] = fmt.Sprintf("pf:%d:c%d", p.ID, p.CommentCount)
+		if v, ok := fragmentCache.Load(keys[i]); ok {
+			out[i] = Post{ID: p.ID, Rendered: template.HTML(strings.ReplaceAll(v.(string), csrfPlaceholder, csrf))}
+		} else {
+			missIdx = append(missIdx, i)
+		}
+	}
+
+	if len(missIdx) > 0 {
+		missIDs := make([]int, len(missIdx))
+		for j, i := range missIdx {
+			missIDs[j] = selected[i].ID
+		}
+		// 本体（断片描画に必要なフルカラム）
+		fq, fa, err := sqlx.In("SELECT `id`,`user_id`,`body`,`mime`,`created_at`,`comment_count` FROM `posts` WHERE `id` IN (?)", missIDs)
+		if err != nil {
+			return nil, err
+		}
+		var fullRows []Post
+		if err := db.SelectContext(ctx, &fullRows, db.Rebind(fq), fa...); err != nil {
+			return nil, err
+		}
+		fullByID := make(map[int]Post, len(fullRows))
+		for _, r := range fullRows {
+			fullByID[r.ID] = r
+		}
+		// コメント
+		cq, ca, err := sqlx.In("SELECT * FROM `comments` WHERE `post_id` IN (?) ORDER BY `created_at` DESC", missIDs)
+		if err != nil {
+			return nil, err
+		}
+		var allComm []Comment
+		if err := db.SelectContext(ctx, &allComm, db.Rebind(cq), ca...); err != nil {
+			return nil, err
+		}
+		// ユーザ（著者＋コメント主）を一括取得
+		uids := make([]int, 0, len(fullRows)+len(allComm))
+		for _, r := range fullRows {
+			uids = append(uids, r.UserID)
+		}
+		for _, c := range allComm {
+			uids = append(uids, c.UserID)
+		}
+		userMap, err := getUsersByIDs(ctx, uids)
+		if err != nil {
+			return nil, err
+		}
+		commentsByPost := map[int][]Comment{}
+		for _, c := range allComm {
+			if len(commentsByPost[c.PostID]) < 3 {
+				c.User = userMap[c.UserID]
+				commentsByPost[c.PostID] = append(commentsByPost[c.PostID], c)
+			}
+		}
+		for _, i := range missIdx {
+			p := fullByID[selected[i].ID]
+			p.User = userMap[p.UserID]
+			comments := commentsByPost[p.ID]
+			for a, b := 0, len(comments)-1; a < b; a, b = a+1, b-1 {
+				comments[a], comments[b] = comments[b], comments[a]
+			}
+			p.Comments = comments
+			p.CSRFToken = csrfPlaceholder
+			frag := renderFragment(p)
+			fragmentCache.Store(keys[i], frag)
+			out[i] = Post{ID: p.ID, Rendered: template.HTML(strings.ReplaceAll(frag, csrfPlaceholder, csrf))}
+		}
+	}
+	return out, nil
 }
 
 // N+1を排除した makePosts。per-post COUNT は posts.comment_count(非正規化列, results に含む)を使用、
@@ -328,6 +493,8 @@ func getTemplPath(filename string) string {
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dbInitialize(ctx)
+	// DBリセットに伴いインメモリキャッシュを全消去（断片/ユーザ/ban集合）。
+	clearAppCaches()
 	// db_initialize は posts id>10000 を削除する。対応する画像ファイルも掃除し
 	// ベンチ毎のアップロード画像がディスクに累積してフルになるのを防ぐ（PHP実装と同様）。
 	if entries, err := os.ReadDir("../public/image"); err == nil {
@@ -469,13 +636,14 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` USE INDEX (idx_feed) ORDER BY `created_at` DESC LIMIT 40")
+	// 鍵クエリ(index-only via idx_feed)。断片ヒット時は本体fetchしない。
+	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `comment_count` FROM `posts` USE INDEX (idx_feed) ORDER BY `created_at` DESC LIMIT 40")
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
+	posts, err := buildListPosts(ctx, results, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
 		return
@@ -516,13 +684,13 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
+	posts, err := buildListPosts(ctx, results, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
 		return
@@ -605,13 +773,13 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` USE INDEX (idx_feed) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40", t.Format(ISO8601Format))
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `comment_count` FROM `posts` USE INDEX (idx_feed) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40", t.Format(ISO8601Format))
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(ctx, results, getCSRFToken(r), false)
+	posts, err := buildListPosts(ctx, results, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
 		return
@@ -756,10 +924,17 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 画像を静的ファイルへ書き出し（nginx直配信用・GET /image はこのファイルに依存）
+	// 画像を静的ファイルへ書き出し（nginx直配信用・GET /image はこのファイルに依存）。
+	// アトミック書き込み: 一時ファイルへ書いてから rename。配信側が書き込み途中の部分ファイルを読まないようにする。
 	ext := map[string]string{"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif"}[mime]
 	if ext != "" {
-		if err := os.WriteFile(fmt.Sprintf("../public/image/%d.%s", pid, ext), filedata, 0644); err != nil {
+		finalPath := fmt.Sprintf("../public/image/%d.%s", pid, ext)
+		tmpPath := fmt.Sprintf("%s.tmp%d", finalPath, pid)
+		if err := os.WriteFile(tmpPath, filedata, 0644); err != nil {
+			log.Print(err)
+			return
+		}
+		if err := os.Rename(tmpPath, finalPath); err != nil {
 			log.Print(err)
 			return
 		}
@@ -887,6 +1062,12 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	for _, id := range r.Form["uid[]"] {
 		db.ExecContext(ctx, query, 1, id)
 	}
+
+	// del_flg 変更に伴い ban集合とユーザキャッシュを無効化（次回再ロード）。
+	bannedMu.Lock()
+	bannedSet = nil
+	bannedMu.Unlock()
+	userCache.Clear()
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }

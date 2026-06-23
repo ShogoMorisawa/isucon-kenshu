@@ -228,3 +228,12 @@ cd /home/isucon/private_isu/benchmarker
 - フィードクエリ: getIndex/getPosts は `USE INDEX (idx_feed)` + comment_count列取得。
 - Post構造体 comment_count タグ済。テンプレは canonical(Ruby/PHP同一DOM)を不変で使用。
 - 検証: 全ページ200・画像配信OK・rendered=comment_count列=live COUNT 一致・コメント/新規投稿の即時可視OK・fail0。→大会ベンチで 1+2 の伸び計測待ち。次は Step3(sync.Map)/Step4(session・native hash)。
+### 第5R-3/4【sync.Map断片キャッシュ / session化 / ban集合 / native digest】Go移植。ローカルfail0(228k-232k, PHPローカル~195k超)。
+- **断片キャッシュ sync.Map**（Go最大の旨味・往復ゼロ）: post.html断片を `pf:{id}:c{count}` でプロセス内キャッシュ。csrfは `@@CSRFTOKEN@@` プレースホルダで全ユーザ共有→動的 ReplaceAll 合成。comment_count自動invalidate。
+  - posts.html を `{{ template "post.html" . }}`→`{{ .Rendered }}` に（whitespace不変＝出力同一）。buildListPosts が鍵をindex-only取得→断片ミス分だけ本体/コメント/ユーザfetch。
+- **getSessionUser キャッシュ化**: userCache(sync.Map id→User)。毎回の SELECT users を排除（初回のみDB）。
+- **ban集合 sync.Map**: del_flg=1 ID集合をメモリ保持。フィード選別の SELECT users IN を排除。
+- **digest native化**: openssl exec → crypto/sha512（バイト互換確認済）。escapeshellarg/os/exec 撤去。
+- 無効化: /initialize と postAdminBanned で clearAppCaches()/ban再ロード。comment/post は key変化で自動切替。
+- ★画像書き込みをアトミック化(temp+rename): 配信側が書込途中の部分ファイルを読む race を解消（fail2→fail0）。
+- 検証: 全ページ200・rendered=live一致・csrf合成(匿名空/ログイン実トークン)・コメント/新規投稿の即時可視・fail0安定(2回)。→大会ベンチで 392k 超えを検証。超えれば go-port を main へ merge。

@@ -1,0 +1,35 @@
+# === 画像配信用に書き出した生成画像（1.6G・ディスク逼迫のため除外） ===
+/webapp/public/image/
+# 念のため拡張子でも除外（public/image配下に限らず生成画像が出ても拾う）
+/webapp/public/image/*.jpg
+/webapp/public/image/*.jpeg
+/webapp/public/image/*.png
+/webapp/public/image/*.gif
+
+# === 依存関係・生成物（各言語実装） ===
+/webapp/php/vendor/
+/webapp/node/node_modules/
+/webapp/python/.venv/
+/webapp/python/__pycache__/
+**/__pycache__/
+*.pyc
+# Goコンパイル済みバイナリ
+/webapp/golang/app
+
+# === ベンチマーカ（巨大データ・生成物） ===
+/benchmarker/userdata/
+/benchmarker/bin/
+/benchmarker/cache/
+
+# === ログ・バックアップ ===
+*.log
+*.bak
+
+# === エクスポート用一時スクリプト（任意・小さいので残してもよいが生成物寄り） ===
+# /webapp/php/export_images.php
+
+# === その他バイナリ・大きい生成物 ===
+*.o
+*.so
+*.tmp
+.DS_Store

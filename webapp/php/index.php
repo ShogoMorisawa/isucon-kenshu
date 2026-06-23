@@ -55,7 +55,9 @@ $container->set('db', function ($c) {
     return new PDO(
         "mysql:dbname={$config['db']['database']};host={$config['db']['host']};port={$config['db']['port']};charset=utf8mb4",
         $config['db']['username'],
-        $config['db']['password']
+        $config['db']['password'],
+        // 永続接続でリクエスト毎の接続確立(TCP+認証)コストを削減。pm=static/16なので常駐接続は最大16前後
+        [PDO::ATTR_PERSISTENT => true]
     );
 });
 

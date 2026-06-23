@@ -1,6 +1,6 @@
 # MEMO.md — 実装ログ & 司令塔（実装係が管理）
 
-## 🚦 ベンチ状態: RUNNING
+## 🚦 ベンチ状態: IDLE
 <!-- 実装係がベンチ前に RUNNING、後に IDLE へ。調査係は RUNNING 中は重い処理を控える -->
 
 ## 📊 スコア履歴
@@ -24,6 +24,7 @@
 | 2026-06-23 13:15 | **170284 / 169319** (pass, fail0/2回) | 【性能1】get_session_user のDB SELECT撤廃→session(memcached)のid/account_name/authorityを返す。score変動幅内(baseline169984比±0)だが**mysqld CPU(39%)を全認証リクエストから1往復削減**＋step4の土台。零リスク・全員一致で採用 |
 | 2026-06-23 13:18 | 166597 / 167404 (pass, fail0/2回) | 【性能2】画像 `Cache-Control: public, max-age=31536000, immutable`、Cache-Control重複(public/max-age 2本)を解消。score変動内(既存1d max-ageで既にテスト窓全体キャッシュ済のため伸びず)。重複ヘッダ修正＋immutableは意味的に正しく零リスクのため採用 |
 | 2026-06-23 13:25 | **181596 / 182627** (pass, fail0/2回) | 【性能3a】server に `gzip off`（HTML非圧縮）。loopbackで圧縮の帯域メリット無し、nginx圧縮CPU+bench解凍CPU(計測bench60%)の二重浪費を排除。~170k→~182k(**+7%, 変動超で確実**)。採用 |
+| 2026-06-23 13:35 | 175733 / 178834 (fail0) | 【性能3b・不採用】php-fpm max_children 16→8。~182k→~177kで一貫して低下（I/O待ちがあり16の方がコア稼働率高い。context-switch懸念は顕在化せず）。**16へ revert**。4はさらに悪化見込みで未試行 |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。

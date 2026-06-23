@@ -22,6 +22,7 @@
 | 2026-06-23 13:0x | **169984** (pass, success161353/**fail0**) | 【仕上げ6】csrf_token警告抑制。views(post/index/banned).phpの `$_SESSION['csrf_token']`→`?? ''`。168597→169984(+0.8%,変動内)だがerror.log肥大(32MB)を停止。採用 |
 | 2026-06-23 13:1x | 166-170k (A/B複数回) | 【仕上げ7】opcache本番化をA/B。JIT(tracing)+validate_timestamps=0=166.0/166.8k、vt=0のみ=169.3k、default=165.9/170.0k。**全て±2.5%の変動幅内で有意差なし**。JITは僅かに不利寄り。footgun(vt=0はコード変更後restart必須)回避のため**defaultへ revert**。スコア確定値は ~170k(169984)とみなす |
 | 2026-06-23 13:15 | **170284 / 169319** (pass, fail0/2回) | 【性能1】get_session_user のDB SELECT撤廃→session(memcached)のid/account_name/authorityを返す。score変動幅内(baseline169984比±0)だが**mysqld CPU(39%)を全認証リクエストから1往復削減**＋step4の土台。零リスク・全員一致で採用 |
+| 2026-06-23 13:18 | 166597 / 167404 (pass, fail0/2回) | 【性能2】画像 `Cache-Control: public, max-age=31536000, immutable`、Cache-Control重複(public/max-age 2本)を解消。score変動内(既存1d max-ageで既にテスト窓全体キャッシュ済のため伸びず)。重複ヘッダ修正＋immutableは意味的に正しく零リスクのため採用 |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。
@@ -36,6 +37,9 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 13:18 【性能2】画像Cache-Control最適化（isucon.conf）。score変動内・ヘッダ正規化。
+  - location分割: `\.(jpg|jpeg|png|gif)$`→`add_header Cache-Control "public, max-age=31536000, immutable"`（expires撤去で重複解消）。
+  - `\.(css|js|ico|svg)$`→`public, max-age=86400`。bak: isucon.conf.bak2
 - 2026-06-23 13:15 【性能1】get_session_user のセッションキャッシュ化（index.php）。score 変動内・mysqld往復削減。
   - `POST /login`・`POST /register` で `$_SESSION['user']` に id/account_name/authority を格納。
   - `get_session_user()` はDBを引かず `$_SESSION['user']` を返すだけ。全認証リクエストから `SELECT users` 1往復を除去。

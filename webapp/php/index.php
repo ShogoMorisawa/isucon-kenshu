@@ -262,6 +262,15 @@ function calculate_passhash($account_name, $password) {
 
 $app->get('/initialize', function (Request $request, Response $response) {
     $this->get('helper')->db_initialize();
+    // db_initialize は posts id>10000 を削除する。対応する画像ファイルもここで掃除し
+    // ベンチ毎のアップロード画像がディスクに累積してフルになるのを防ぐ。
+    $imgdir = dirname(__DIR__) . '/public/image';
+    foreach (glob("{$imgdir}/*") as $f) {
+        $id = (int)basename($f);
+        if ($id > 10000) {
+            @unlink($f);
+        }
+    }
     return $response;
 });
 

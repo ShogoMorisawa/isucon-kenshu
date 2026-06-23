@@ -17,6 +17,7 @@
 | 2026-06-23 12:30 | 65377 (pass, fail0/2回再現) | 【保全2前半】imgdataのDB保存停止+UPDATE imgdata=''+OPTIMIZE TABLE で posts 1.4GB→7MB(disk 84%→75%)。但しテーブル縮小でオプティマイザが idx_created_at を捨て全件scan+filesort化→79041→65377に悪化(2回再現,変動でない) |
 | 2026-06-23 12:34 | **81957** (pass, success78655/**fail0**) | 【保全2後半】/ と /posts に `FORCE INDEX (idx_created_at)` を付与しBackward index scan強制。65377→81957で完全回復(81758比+0.2%)。保全2は最終的にスコア維持+ディスク3GB解放。採用 |
 | 2026-06-23 12:38 | **96704** (pass, success91961/**fail0**) | 【性能3】digest()を `hash('sha512',$src)` にネイティブ化（openssl外部プロセス起動を排除。バイト一致確認済）。81957→96704(+18%)。login/register多シナリオで大きく寄与。採用 |
+| 2026-06-23 12:4x | **160239** (pass, success152052/**fail0**) | 【性能4】make_postsのN+1一括化。per-post COUNT+comments(40往復)→comments 1クエリ(IN, DESC)で取得し件数もPHPで算出、user取得もpreload_users(IN)で一括。96704→160239(+66%)。レンダリング件数/コメント数をDBと突合し一致確認。採用 |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。
@@ -31,6 +32,12 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 12:4x 【性能4】make_posts のN+1一括化（index.php）。score 96704→160239(+66%)。
+  - per-post `COUNT(*)` と per-post コメントSELECT（計~40往復/ページ）を撤廃。
+  - 表示post確定後、`SELECT ... FROM comments WHERE post_id IN (...) ORDER BY created_at DESC` を1クエリで取得。
+    件数は結果から PHP集計、表示は先頭3件(all_commentsなら全件)→array_reverse。idx_post_created が効く。
+  - user取得は `preload_users()`（`WHERE id IN (...)`）でpost-user/コメントuserを一括プリロード＋get_userメモ化。
+  - 正当性: 20件表示・コメント件数をDBのCOUNTと突合し一致を確認済。
 - 2026-06-23 12:38 【性能3】digest() ネイティブhash化。score 81957→96704(+18%)。
   - `digest($src)` を `return hash('sha512', $src);` に。openssl外部プロセス起動/escapeshellarg/sed が不要に。
   - 既存passhash互換（shellのopenssl出力とhash()がバイト一致を実測確認）。calculate_salt/calculate_passhash はそのまま。

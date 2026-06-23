@@ -79,8 +79,6 @@ func init() {
 		memdAddr = "localhost:11211"
 	}
 	memcacheClient = memcache.New(memdAddr)
-	// 無設定だと MaxIdleConns=2 で3本目以降が毎回接続churn（DBプールと同型の問題）。高並列向けに引き上げ。
-	memcacheClient.MaxIdleConns = 128
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
@@ -141,90 +139,38 @@ func getSession(r *http.Request) *sessions.Session {
 	return session
 }
 
-// ===== セッション値の in-process キャッシュ（最頻パスの memcached 同期往復を排除） =====
-// cookie値→デコード済みセッション値。Save毎にSet-Cookieが変わるので原則 cookie値は内容と1対1。
-// 念のため Save時に saveSess() で当該cookieのキャッシュを無効化し、読み取り専用リクエスト間だけ供給する。
-type sessVals struct {
-	uid    int64
-	hasUID bool
-	csrf   string
-	notice string
-}
-
-var sessionValsCache sync.Map // string(cookie value) -> sessVals
-
-func sessCookieKey(r *http.Request) (string, bool) {
-	c, err := r.Cookie("isuconp-go.session")
-	if err != nil || c.Value == "" {
-		return "", false
-	}
-	return c.Value, true
-}
-
-func loadSessVals(r *http.Request) sessVals {
-	key, hasKey := sessCookieKey(r)
-	if hasKey {
-		if v, ok := sessionValsCache.Load(key); ok {
-			return v.(sessVals)
-		}
-	}
-	session := getSession(r) // memcached 読み（キャッシュミス時のみ）
-	sv := sessVals{}
-	if uid, ok := session.Values["user_id"]; ok && uid != nil {
-		switch x := uid.(type) {
-		case int:
-			sv.uid, sv.hasUID = int64(x), true
-		case int64:
-			sv.uid, sv.hasUID = x, true
-		}
-	}
-	if c, ok := session.Values["csrf_token"]; ok && c != nil {
-		sv.csrf, _ = c.(string)
-	}
-	if n, ok := session.Values["notice"]; ok && n != nil {
-		sv.notice, _ = n.(string)
-	}
-	if hasKey {
-		sessionValsCache.Store(key, sv)
-	}
-	return sv
-}
-
-func invalidateSessCache(r *http.Request) {
-	if key, ok := sessCookieKey(r); ok {
-		sessionValsCache.Delete(key)
-	}
-}
-
-// session.Save のラッパ。保存に伴い当該cookieのキャッシュを無効化（次回読みで最新反映）。
-func saveSess(session *sessions.Session, r *http.Request, w http.ResponseWriter) error {
-	err := session.Save(r, w)
-	invalidateSessCache(r)
-	return err
-}
-
 func getSessionUser(r *http.Request) User {
-	sv := loadSessVals(r)
-	if !sv.hasUID {
+	ctx := r.Context()
+	session := getSession(r)
+	uid, ok := session.Values["user_id"]
+	if !ok || uid == nil {
 		return User{}
 	}
-	return getUserByID(r.Context(), int(sv.uid))
+
+	// userCache(sync.Map) 経由でDB往復を排除（初回のみDB）
+	var id int
+	switch v := uid.(type) {
+	case int:
+		id = v
+	case int64:
+		id = int(v)
+	default:
+		return User{}
+	}
+	return getUserByID(ctx, id)
 }
 
 func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
-	// 高頻度パス: notice が無ければ memcached を一切触らない。
-	if loadSessVals(r).notice == "" {
-		return ""
-	}
-	// 消費（read-once）: memcached 側からも削除し、キャッシュを無効化。
 	session := getSession(r)
-	notice := ""
-	if v, ok := session.Values[key]; ok && v != nil {
-		notice, _ = v.(string)
+	value, ok := session.Values[key]
+
+	if !ok || value == nil {
+		return ""
+	} else {
 		delete(session.Values, key)
-		saveSess(session, r, w)
+		session.Save(r, w)
+		return value.(string)
 	}
-	return notice
 }
 
 // ===== インメモリキャッシュ（プロセス内・往復ゼロ。Goの構造的優位） =====
@@ -540,7 +486,12 @@ func isLogin(u User) bool {
 }
 
 func getCSRFToken(r *http.Request) string {
-	return loadSessVals(r).csrf
+	session := getSession(r)
+	csrfToken, ok := session.Values["csrf_token"]
+	if !ok {
+		return ""
+	}
+	return csrfToken.(string)
 }
 
 func secureRandomStr(b int) string {
@@ -621,13 +572,13 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 		session := getSession(r)
 		session.Values["user_id"] = u.ID
 		session.Values["csrf_token"] = secureRandomStr(16)
-		saveSess(session, r, w)
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/", http.StatusFound)
 	} else {
 		session := getSession(r)
 		session.Values["notice"] = "アカウント名かパスワードが間違っています"
-		saveSess(session, r, w)
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/login", http.StatusFound)
 	}
@@ -660,7 +611,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	if !validated {
 		session := getSession(r)
 		session.Values["notice"] = "アカウント名は3文字以上、パスワードは6文字以上である必要があります"
-		saveSess(session, r, w)
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/register", http.StatusFound)
 		return
@@ -673,7 +624,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	if exists == 1 {
 		session := getSession(r)
 		session.Values["notice"] = "アカウント名がすでに使われています"
-		saveSess(session, r, w)
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/register", http.StatusFound)
 		return
@@ -694,7 +645,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	session.Values["user_id"] = uid
 	session.Values["csrf_token"] = secureRandomStr(16)
-	saveSess(session, r, w)
+	session.Save(r, w)
 
 	http.Redirect(w, r, "/", http.StatusFound)
 }
@@ -703,7 +654,7 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 	session := getSession(r)
 	delete(session.Values, "user_id")
 	session.Options = &sessions.Options{MaxAge: -1}
-	saveSess(session, r, w)
+	session.Save(r, w)
 
 	http.Redirect(w, r, "/", http.StatusFound)
 }
@@ -932,7 +883,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		session := getSession(r)
 		session.Values["notice"] = "画像が必須です"
-		saveSess(session, r, w)
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
@@ -951,7 +902,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		} else {
 			session := getSession(r)
 			session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
-			saveSess(session, r, w)
+			session.Save(r, w)
 
 			http.Redirect(w, r, "/", http.StatusFound)
 			return
@@ -967,7 +918,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	if len(filedata) > UploadLimit {
 		session := getSession(r)
 		session.Values["notice"] = "ファイルサイズが大きすぎます"
-		saveSess(session, r, w)
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/", http.StatusFound)
 		return

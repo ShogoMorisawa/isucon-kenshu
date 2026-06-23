@@ -19,6 +19,7 @@
 | 2026-06-23 12:38 | **96704** (pass, success91961/**fail0**) | 【性能3】digest()を `hash('sha512',$src)` にネイティブ化（openssl外部プロセス起動を排除。バイト一致確認済）。81957→96704(+18%)。login/register多シナリオで大きく寄与。採用 |
 | 2026-06-23 12:4x | **160239** (pass, success152052/**fail0**) | 【性能4】make_postsのN+1一括化。per-post COUNT+comments(40往復)→comments 1クエリ(IN, DESC)で取得し件数もPHPで算出、user取得もpreload_users(IN)で一括。96704→160239(+66%)。レンダリング件数/コメント数をDBと突合し一致確認。採用 |
 | 2026-06-23 12:5x | **168597** (pass, success160084/**fail0**) | 【性能5】PDO `ATTR_PERSISTENT=>true`。接続確立コスト削減。160239→168597(+5%)。max_connections=151に対し常駐~16で安全。採用 |
+| 2026-06-23 13:0x | **169984** (pass, success161353/**fail0**) | 【仕上げ6】csrf_token警告抑制。views(post/index/banned).phpの `$_SESSION['csrf_token']`→`?? ''`。168597→169984(+0.8%,変動内)だがerror.log肥大(32MB)を停止。採用 |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。
@@ -33,6 +34,8 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 13:0x 【仕上げ6】csrf_token警告抑制（views 3ファイル）。error.log肥大停止。score 168597→169984。
+  - post.php/index.php/banned.php の `escape_html($_SESSION['csrf_token'])`→`... ?? ''`。匿名ユーザでも警告を出さない。ログイン時の出力は不変。
 - 2026-06-23 12:5x 【性能5】PDO永続接続。score 160239→168597(+5%)。
   - `new PDO(...)` 第4引数に `[PDO::ATTR_PERSISTENT => true]`。fpm worker16で常駐接続最大~16（max_connections=151内）。
 - 2026-06-23 12:4x 【性能4】make_posts のN+1一括化（index.php）。score 96704→160239(+66%)。

@@ -43,6 +43,11 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 16:4x 【第4R-8(系A3)】build_list_html の users IN を ban集合キャッシュで撤廃（index.php）。大会ベンチ待ち。
+  - `banned_user_ids()`: del_flg=1 のid集合を APCu キャッシュ。フィード選別を「著者がban集合に無い投稿を上位20件」に変更し、毎回の `SELECT users IN(~21)` を排除。
+  - 断片ミス時のみ、ミス投稿の著者＋コメント主を preload_users で取得。**全ヒット時は users/comments のDB往復が一切走らない**。
+  - invalidate: `/initialize`(apcu_clear_cache) と `POST /admin/banned`(apcu_delete 'banned_uids')。register は del_flg=0 で無関係。
+  - 検証: GET / ・/posts が ban集合版=旧del_flg版 で**バイト一致**（banユーザ20名、top40に被banユーザ含む状態で確認）。/@user・コメント即時反映も正常。
 - 2026-06-23 16:3x 【第4R-7(系A2)】断片キャッシュ memcached→**APCu**（index.php + システム依存）。大会ベンチ待ち。
   - `build_list_html` の getMulti/setMulti を `apcu_fetch`/`apcu_store($arr,null,600)` へ。最ホットGET /のmemcached TCP往復(21キー)をプロセス共有メモリ(数µs)に置換。
   - `/initialize` で `apcu_clear_cache()`（＋セッション用memcachedは feed_cache()->flush() 継続）。キー体系 `pf:{id}:c{count}`・TTL600・comment_count自動invalidate は不変。

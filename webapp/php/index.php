@@ -368,6 +368,22 @@ function feed_cache() {
     return $mc;
 }
 
+// banされたユーザID集合(del_flg=1, 初期~2%=約50件)を APCu キャッシュ。
+// 変化するのは /initialize(db_initialize) と POST /admin/banned のみ＝ほぼ不変。registerはdel_flg=0なので無関係。
+// これでフィード選別の「毎回の SELECT users IN」を排除（ホットパスから同期DB往復を除去）。
+function banned_user_ids($helper) {
+    $b = apcu_fetch('banned_uids');
+    if (!is_array($b)) {
+        $ids = $helper->db()->query('SELECT `id` FROM `users` WHERE `del_flg` = 1')->fetchAll(PDO::FETCH_COLUMN);
+        $b = [];
+        foreach ($ids as $id) {
+            $b[(int)$id] = true;
+        }
+        apcu_store('banned_uids', $b, 0); // TTL無し。ban/initializeで明示invalidate
+    }
+    return $b;
+}
+
 // 1投稿分の post.php をHTML文字列にレンダリング（csrfはプレースホルダ）。
 function render_one_post_fragment(array $post) {
     $csrf_token = CSRF_PLACEHOLDER; // post.php が参照する
@@ -383,14 +399,11 @@ function render_one_post_fragment(array $post) {
 // csrf はプレースホルダで描画し最後に実トークンへ合成（断片を全ユーザで共有）。
 function build_list_html($helper, array $rows) {
     // 断片キャッシュは APCu(プロセス共有メモリ)。memcachedのTCP往復を排し getは数µs。単一サーバなので一貫性問題なし。
-    // del_flg=0 の投稿を最大 POSTS_PER_PAGE 件選ぶ（user は一括取得）
-    $user_cache = [];
-    $helper->preload_users(array_map(fn($p) => $p['user_id'], $rows), $user_cache);
+    // 選別はキャッシュ済みban集合で行い、毎回の SELECT users IN を排除する。
+    $banned = banned_user_ids($helper);
     $selected = [];
     foreach ($rows as $p) {
-        $u = $user_cache[$p['user_id']] ?? null;
-        if ($u && $u['del_flg'] == 0) {
-            $p['user'] = $u;
+        if (!isset($banned[$p['user_id']])) { // del_flg=1 でない著者の投稿のみ
             $selected[] = $p;
             if (count($selected) >= POSTS_PER_PAGE) {
                 break;
@@ -411,20 +424,28 @@ function build_list_html($helper, array $rows) {
         $found = [];
     }
 
-    // ヒットしなかった投稿だけ、コメント(最新3件)とそのユーザをまとめて取得
-    $miss_ids = [];
+    // ヒットしなかった投稿だけ、コメント(最新3件)＋必要なユーザ(著者・コメント主)をまとめて取得。
+    // 全ヒット時は users/comments のDB往復が一切走らない。
+    $miss = [];
     foreach ($selected as $p) {
         if (!isset($found[$keys[$p['id']]])) {
-            $miss_ids[] = $p['id'];
+            $miss[] = $p;
         }
     }
+    $user_cache = [];
     $comments_by_post = [];
-    if ($miss_ids) {
+    if ($miss) {
+        $miss_ids = array_map(fn($p) => $p['id'], $miss);
         $ph = implode(',', array_fill(0, count($miss_ids), '?'));
         $ps = $helper->db()->prepare("SELECT `id`,`post_id`,`user_id`,`comment`,`created_at` FROM `comments` WHERE `post_id` IN ({$ph}) ORDER BY `created_at` DESC");
         $ps->execute($miss_ids);
         $all = $ps->fetchAll(PDO::FETCH_ASSOC);
-        $helper->preload_users(array_map(fn($c) => $c['user_id'], $all), $user_cache);
+        // 必要ユーザ = ミス投稿の著者 + そのコメント主
+        $uids = array_map(fn($p) => $p['user_id'], $miss);
+        foreach ($all as $c) {
+            $uids[] = $c['user_id'];
+        }
+        $helper->preload_users($uids, $user_cache);
         foreach ($all as $c) {
             $pid = $c['post_id'];
             if (count($comments_by_post[$pid] ?? []) < 3) {
@@ -442,6 +463,7 @@ function build_list_html($helper, array $rows) {
             $html .= $found[$k];
             continue;
         }
+        $p['user'] = $user_cache[$p['user_id']] ?? null;
         $p['comments'] = array_reverse($comments_by_post[$p['id']] ?? []);
         $frag = render_one_post_fragment($p);
         $to_set[$k] = $frag;
@@ -791,6 +813,9 @@ $app->post('/admin/banned', function (Request $request, Response $response) {
         $ps = $db->prepare($query);
         $ps->execute([1, $id]);
     }
+
+    // ban集合キャッシュを無効化（次回フィード選別で再構築）
+    apcu_delete('banned_uids');
 
     return redirect($response, '/admin/banned', 302);
 });

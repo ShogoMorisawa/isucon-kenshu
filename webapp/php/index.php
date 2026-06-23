@@ -267,6 +267,49 @@ function bump_feed_version() {
     }
 }
 
+// csrf_token はユーザ固有なので断片HTMLにはプレースホルダを埋め、最後に実トークンへ置換する
+const CSRF_PLACEHOLDER = '@@CSRFTOKEN@@';
+
+// 1投稿分の post.php をHTML文字列にレンダリング（csrfはプレースホルダ）。
+function render_one_post_fragment(array $post) {
+    $csrf_token = CSRF_PLACEHOLDER; // post.php が参照する
+    ob_start();
+    require __DIR__ . '/views/post.php';
+    return ob_get_clean();
+}
+
+// 投稿リストのHTMLを断片キャッシュで組み立てる。
+// 断片キーは (post_id, comment_count)。コメント追加で comment_count が変わり自動的に別キー＝自動invalidate。
+// 投稿本文/画像/ユーザ名/最新3コメントは全ユーザ共通なので断片はユーザ間で再利用でき、csrfだけ後段で合成する。
+function render_post_list(array $posts) {
+    $mc = feed_cache();
+    $keys = [];
+    foreach ($posts as $p) {
+        $keys[$p['id']] = 'pf:' . (int)$p['id'] . ':c' . (int)($p['comment_count'] ?? 0);
+    }
+    $found = $keys ? $mc->getMulti(array_values($keys)) : [];
+    if ($found === false) {
+        $found = [];
+    }
+    $html = '';
+    $to_set = [];
+    foreach ($posts as $p) {
+        $k = $keys[$p['id']];
+        if (isset($found[$k])) {
+            $html .= $found[$k];
+        } else {
+            $frag = render_one_post_fragment($p);
+            $to_set[$k] = $frag;
+            $html .= $frag;
+        }
+    }
+    if ($to_set) {
+        $mc->setMulti($to_set, 600);
+    }
+    // ユーザ固有の csrf を最後に1回だけ合成
+    return str_replace(CSRF_PLACEHOLDER, escape_html($_SESSION['csrf_token'] ?? ''), $html);
+}
+
 function validate_user($account_name, $password) {
     if (!(preg_match('/\A[0-9a-zA-Z_]{3,}\z/', $account_name) && preg_match('/\A[0-9a-zA-Z_]{6,}\z/', $password))) {
         return false;
@@ -448,7 +491,7 @@ $app->get('/posts/{id}', function (Request $request, Response $response, $args) 
 
     $me = $this->get('helper')->get_session_user();
 
-    return $this->get('view')->render($response, 'post.php', ['post' => $post, 'me' => $me]);
+    return $this->get('view')->render($response, 'post.php', ['post' => $post, 'me' => $me, 'csrf_token' => $_SESSION['csrf_token'] ?? '']);
 });
 
 $app->post('/', function (Request $request, Response $response) {

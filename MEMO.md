@@ -43,6 +43,13 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 14:3x 【第4R-1】投稿リストの断片HTMLキャッシュ（index.php + views/post.php,posts.php）。**ローカルfail0確認**。大会ベンチ待ち。
+  - ⚠️前提変更: ローカル計測はベンチ同居でCPU食合いのため数値は信用しない。fail0確認のみに使用。大会ベンチ(別マシン)が真値（直近292,146）。
+  - `render_post_list($posts)`: 各投稿のpost.php出力を `pf:{id}:c{comment_count}` キーで memcached キャッシュ（getMulti/setMulti, TTL600）。
+  - **自動invalidate**: コメント追加→feed_version bump→feedデータ再構築→comment_count変化→断片キーが変わり自動再生成（explicit delete不要）。
+  - csrf_token はユーザ固有のため断片内をプレースホルダ`@@CSRFTOKEN@@`にして描画し、最後に `str_replace` で実トークン合成。→1断片を匿名/全ログインユーザで共有。
+  - post.php は `$csrf_token ?? ($_SESSION...)` 参照に変更。/posts/{id} 詳細renderにも csrf_token を渡す。
+  - 理論的効果: 認証済GET /含む全リスト描画で post.php テンプレ実行を「投稿×コメント状態」毎に1回へ削減。大会環境(ベンチ分のCPUが空く)でphp-fpm(律速80%)の描画CPUを削減する狙い。
 - 2026-06-23 14:0x 【性能6】index母数 LIMIT 100→40（/ と /posts, index.php）。score ~192k→~195.6k。削除ユーザ~2%なので40で20件確実。
 - 2026-06-23 13:5x 【性能4】GET / フィードキャッシュ（index.php, memcached）。score ~182k→~192k(+5.5%, fail0)。
   - `feed_cache()`=アプリ用Memcached永続接続(127.0.0.1:11211, persistent_id=feedpool)。`feed_version()`/`bump_feed_version()`=increment整数。

@@ -203,9 +203,9 @@ function validate_user($account_name, $password) {
 }
 
 function digest($src) {
-    // opensslのバージョンによっては (stdin)= というのがつくので取る
-    $src = escapeshellarg($src);
-    return trim(`printf "%s" {$src} | openssl dgst -sha512 | sed 's/^.*= //'`);
+    // 旧実装は `printf | openssl dgst -sha512 | sed` の外部プロセス起動。
+    // PHPネイティブhashとバイト一致を確認済みのため置換（プロセスfork/exec排除）。
+    return hash('sha512', $src);
 }
 
 function calculate_salt($account_name) {

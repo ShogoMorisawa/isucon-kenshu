@@ -16,6 +16,7 @@
 | 2026-06-23 12:2x | **79041** (pass, success76121/fail0) | 【保全1】MySQL binlog無効化(`disable-log-bin`)+`RESET MASTER`で1.8GB解放(96%→84%)、`innodb_flush_log_at_trx_commit=2`。スコアは81758比-3%だが変動幅内。ディスク危機回避が主目的。採用 |
 | 2026-06-23 12:30 | 65377 (pass, fail0/2回再現) | 【保全2前半】imgdataのDB保存停止+UPDATE imgdata=''+OPTIMIZE TABLE で posts 1.4GB→7MB(disk 84%→75%)。但しテーブル縮小でオプティマイザが idx_created_at を捨て全件scan+filesort化→79041→65377に悪化(2回再現,変動でない) |
 | 2026-06-23 12:34 | **81957** (pass, success78655/**fail0**) | 【保全2後半】/ と /posts に `FORCE INDEX (idx_created_at)` を付与しBackward index scan強制。65377→81957で完全回復(81758比+0.2%)。保全2は最終的にスコア維持+ディスク3GB解放。採用 |
+| 2026-06-23 12:38 | **96704** (pass, success91961/**fail0**) | 【性能3】digest()を `hash('sha512',$src)` にネイティブ化（openssl外部プロセス起動を排除。バイト一致確認済）。81957→96704(+18%)。login/register多シナリオで大きく寄与。採用 |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。
@@ -30,6 +31,9 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 12:38 【性能3】digest() ネイティブhash化。score 81957→96704(+18%)。
+  - `digest($src)` を `return hash('sha512', $src);` に。openssl外部プロセス起動/escapeshellarg/sed が不要に。
+  - 既存passhash互換（shellのopenssl出力とhash()がバイト一致を実測確認）。calculate_salt/calculate_passhash はそのまま。
 - 2026-06-23 12:34 【保全2】imgdataのDB保存停止＋領域回収（index.php + DB）。score維持(81957)・disk 3.8GB空き(75%)。
   - `POST /`: imgdataを `''` でINSERT（NOT NULL回避）、tmpは1回だけ読む、ファイル書出しは必須化(@外し)。
   - `GET /image/{id}.{ext}`: DB依存を撤廃。public/image のファイルを is_file→file_get_contents で返す、無ければ404（nginxが基本直配信、ここは保険）。

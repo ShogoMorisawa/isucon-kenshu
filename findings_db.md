@@ -297,3 +297,72 @@ EXPLAIN: `type:index / key:idx_created_at / rows:40 / Backward index scan`。
 3. **②GET / のフィードid一覧 memcached 化でDB往復ゼロ**（①の上位互換・高天井。invalidationはPOST /時のみで高ヒット率。fail0維持が条件）。
 4. ④/@user の集計を users 非正規化＋`SUM(posts.comment_count)`で往復削減（中〜小）。
 - 🔑 結論: **DBの「速度」はもう限界まで来ている。残る伸びは(a)ホットパスでDBを触る回数・量を更に削る[①②④]、(b)サーバを横に割ってCPUを増やす[③]の2系統**。純DBチューニング(index追加/my.cnf)単独の伸びは無い。
+
+---
+---
+
+# [16:5x] Go分析（go-port / 大会: PHP 392,566 vs Go 278,809・ローカルは Go 228k > PHP 195k の逆転）
+
+## 結論（DB視点の核心）
+**Goのindex/N+1/非正規化の移植は正しくできている。負ける原因は「DBコネクション管理が高並列向けに全く設定されていない」こと。**
+ローカル(低並列)では露見せず、大会(別マシンから高並列)で初めて牙を剥く3点が揃っている：
+1. **コネクションプール無設定**（最大の犯人）
+2. **TCP接続（PHPはunix socket）**
+3. **interpolateParams未指定＝パラメータ付きクエリが prepare+execute の2往復**
+
+「ローカルで勝つが大会で負ける」のは、**ローカルはベンチが同一2コアを食い合い実効並列が抑制される**ため上記が顕在化せず、Goの低い1リクエストCPUが勝つ。
+**大会はベンチが別マシンから高並列を叩く**ため、コネクション嵐・往復倍増が爆発し、安定した16本常駐プールのPHPに逆転される。
+
+## ① 【最大の犯人】DBコネクションプールが無設定 → 高並列で接続嵐＆枯渇リスク
+- (1)現象: `app.go:1111 sqlx.Open(...)` の後に **`SetMaxOpenConns`/`SetMaxIdleConns`/`SetConnMaxLifetime` が一切無い**（grep確認）。
+  → database/sql のデフォルトは **MaxOpenConns=0（無制限）/ MaxIdleConns=2 / ConnMaxLifetime=0**。
+- (2)原因仮説（なぜ大会で負けるか）:
+  - net/http はリクエスト毎にgoroutineを無制限に起こす。**アプリ並列度に上限が無い**（PHPの `pm.max_children=16` のような天井が無い）。
+  - 各goroutineがDBを触ると、**warm接続は2本しか保持されない**ので3本目以降は毎回 TCP接続＋MySQL認証ハンドシェイクで**新規接続→使用後即クローズ**を繰り返す（churn）。
+    PHPは `PDO ATTR_PERSISTENT` ×16workerで **16本を常時再利用**（接続確立コストはほぼゼロ）。ここが決定的な差。
+  - 高並列が進むと MaxOpenConns無制限ゆえ接続数が `max_connections=151` に張り付き、**`Error 1040: Too many connections` でリクエストfail**→スコア急落（278k）。
+  - 実測の傍証: ローカルベンチ後 `Max_used_connections=28`（151未満で耐えた）/ `Aborted_connects=0` / `Connection_errors_max_connections=0`。
+    **= ローカルの並列度では28本で収まり問題化しないが、大会の並列度では151を超え得る**。これが逆転の主因。
+- (3)推奨アクション（実装係へ）:
+  - `db.SetMaxOpenConns(N)` と **`db.SetMaxIdleConns(N)` を同値**に設定（idle=openにすると接続が閉じられず常時再利用＝churn消滅）。`db.SetConnMaxLifetime(0)`（張り替え不要）。
+  - Nは **max_connections(151)に十分な余裕を残しつつ、2コアDBが捌ける範囲**。まず **N=64** 程度を起点にA/B（mysqldがCPU飽和するなら32へ。多すぎるとロック競合/コンテキストスイッチで逆効果）。
+  - 効果: 接続確立コストをゼロ化（PHPと同条件）＋ MaxOpenConnsが**自然なバックプレッシャ**になり、過剰goroutineは接続待ちで整列→DB枯渇(1040)を防止。**これ単体で大会の逆転は解消見込み。最優先。**
+- (4)根拠: PHPの安定性の正体は「16本常駐の有界プール」。Goは無界＆warm2本で真逆。高並列で接続コスト×回数が爆発。
+
+## ② TCP接続のまま（PHPはunix socket）→ ①のchurnコストを増幅
+- (1)現象: `app.go:1101 cfg.Net="tcp"`, Addr=`localhost:3306`。PHP実装は `host=localhost`→**unix socket**（実測 `/var/run/mysqld/mysqld.sock`）。
+- (2)原因仮説: 同一ホストならsocketの方がTCPループバックより接続確立・往復が軽い。①のchurnで毎回新規接続を張る現状、TCPハンドシェイク分が上乗せされ二重に損。
+- (3)推奨アクション: 同一ホスト構成なら `cfg.Net="unix"; cfg.Addr="/var/run/mysqld/mysqld.sock"`。
+  （※将来DBを別サーバへ分離するならTCPのまま。その時こそ①のプール常駐再利用が更に重要）。
+- (4)根拠: ①を直せばchurn自体が消えるので寄与は中。だが socket化はゼロリスクで効く。①と併せて実施推奨。
+
+## ③ interpolateParams 未指定 → パラメータ付きクエリが毎回2往復（PHPは1往復）
+- (1)現象: `cfg.Params` は charset のみ（grep確認、interpolateParams無し）。go-sql-driver は `?` 付きクエリを**binary protocolのprepared statement**で実行＝**prepare＋execute＋（closeで）最大2〜3往復/クエリ**。
+  PHPのPDO mysqlは既定で **emulated prepares＝client側展開で1往復**。
+- (2)原因仮説: 1 GET / でフィード鍵クエリ＋(ミス時)本体/コメント/ユーザ＝複数クエリ。各クエリが2往復だと**DB往復が実質倍増**。高並列＋①のchurnと重なり、接続占有時間が伸び、さらに接続が枯渇しやすくなる悪循環。
+- (3)推奨アクション: DSNに **`interpolateParams=true`**（`cfg.Params["interpolateParams"]="true"`）。client側でパラメータ展開し1往復化＝PHPと同条件に。
+  併せて `db.SelectContext/GetContext` のラウンドトリップが半減。SQLは全て `?` プレースホルダで multi-statement не使用のため安全。
+- (4)根拠: 往復数はDB律速・接続占有の主因。PHPが1往復で済ませている所をGoは2往復している＝高並列で効く差。
+
+## ④ 移植は概ね良好だった点（DB施策の移植OK確認）
+- **idx_feed covering＋2段化は正しく機能**: `idx_feed=(created_at, comment_count, user_id)` と確認。getIndex(640)/getPosts(776)の鍵クエリ `SELECT id,user_id,comment_count ... USE INDEX(idx_feed)` は
+  EXPLAIN **`Backward index scan; Using index`（テーブル無アクセス＝真のindex-only）**。user_idもindexに入っており断片ヒット時は本体fetch無し。**ここはPHPと同等以上。問題なし。**
+- **N+1のIN一括化も移植OK**: makePosts/buildListPosts は comments を `WHERE post_id IN(?)` 1クエリ、users も getUsersByIDs の `IN(?)`一括＋sync.Mapキャッシュ。**むしろGoはuserCache/bannedSetをプロセス常駐**でき、PHPのリクエスト内メモ化より強い（往復はPHP以下）。
+- comment_count非正規化（postComment:998のUPDATE、dbInitialize再集計）も移植OK。
+- → **「DBに来るクエリの種類・本数」自体はGo≦PHPで良好。問題は1クエリあたりの往復数(③)と接続の張り方(①②)という"クエリの外側"。**
+
+## ⑤ 軽微なDB往復の無駄（①②③の後の余地）
+- `getAccountName`: `SELECT id,user_id,comment_count FROM posts WHERE user_id=?`(687) と `SELECT id FROM posts WHERE user_id=?`(707) で**posts-by-userを2回**実行（PHPでも指摘した重複）。707は687の結果からid流用で削除可。
+  さらに commentCount(700) と commentedCount(728) は users非正規化 or `SUM(posts.comment_count)`で往復削減可（第4R④と同じ）。/@user頻度ぶんだけ効く。
+
+## 非DB（管轄外だがGo逆転の共犯。アプリ係へ要連携）
+- **テンプレートを毎リクエスト ParseFiles**: getIndex(656)/getAccountName(741)/getPosts(797)/getPostsID(838)/getLogin/getRegister が**ハンドラ内で `template.ParseFiles` をディスクから実行・毎回パース**。PHPはopcacheでコンパイル済。
+  高並列ではこのディスクI/O＋パースCPUが致命的。**`var tmpl = template.Must(...)` でグローバルに1回だけパースし使い回す**べき（postFragTmplはOnceで正しくやれている＝これを全テンプレに横展開）。これはCPU律速を直撃する大物。→ findings_app 連携。
+
+## まとめ（実装係向け・効果順 / Goを大会でPHP超えにする）
+1. **①DBプール設定 `SetMaxOpenConns(64)＋SetMaxIdleConns(64)＋SetConnMaxLifetime(0)`**（接続churn/枯渇を解消・最優先・大会逆転の主因）
+2. **③DSNに `interpolateParams=true`**（クエリ往復を2→1へ半減・PHPと同条件化）
+3. **②`cfg.Net="unix"` でsocket接続**（接続コスト低減・ゼロリスク）
+4. （アプリ係）**テンプレートのグローバル1回パース化**（毎リクエストParseFiles撤廃・CPU直撃の大物）
+5. ⑤getAccountNameの重複postsクエリ削除＋/@user集計の非正規化（中〜小）
+- 🔑 **Goが遅いのは言語のせいでもDB施策の移植漏れでもない。「無界・非常駐・2往復」なコネクション設定が高並列で崩れているだけ**。①②③は数行の追加で、大会スコアはPHP超えに戻る可能性が高い。

@@ -208,3 +208,39 @@ cd /home/isucon/private_isu/benchmarker
 - DB接続: env.sh の ISUCONP_DB_USER=isuconp / PASSWORD=isuconp / NAME=isuconp。host=localhost, port=3306。
 - DB件数(初期): posts=10004。テーブル: users, posts, comments。
 - 他言語サービス(go/node/python)は disabled。Rubyは disabled 済み。
+
+---
+## 🌿 go-port ブランチ（実験: Go移植, main=php-best-392k は不可侵）
+- main にタグ `php-best-392k`（大会392,566）。Goが超えなければ `git checkout main` + `./use-php.sh` で確実に戻る。
+- **切り替え3点セット**（コード=git, サービス=systemctl, nginx=向き先）:
+  - Go へ: `git checkout go-port && (cd webapp/golang && go build -o app) && ./use-go.sh`
+  - PHP へ: `git checkout main && ./use-php.sh`
+  - use-go.sh / use-php.sh が nginx設定(isucon.conf.go/.php)切替＋サービス起動/停止/enable を実施。
+  - DBの idx_feed・comment_count列、nginxの画像/静的/immutable は両実装共通（切替不要）。
+- nginx設定の実体: /etc/nginx/sites-available/ に isucon.conf.go(Go), isucon.conf.php(PHP最良), isucon.conf(=現用) を保存。
+- ⚠️ システム依存（共通）: php8.3-apcu, idx_feed索引, comment_count列。
+### 第5R-1【切替+可逆性】stock Go 起動。fail0(ローカル19885, 最適化前). 
+- app.go の Post 構造体に `db:"comment_count"` タグ追加（schema変更でSELECT *がsqlx mapエラーになるのを修正）。
+- 可逆性確認: PHP⇄Go 切替OK、isu-go enabled(再起動耐性)。→大会ベンチで Go 初期スコア計測待ち。
+### 第5R-2【画像ファイル化 + N+1解消/comment_count/idx_feed】Go移植。ローカルfail0(141,159, stock比7x)。
+- 画像: postIndex はファイル書き出し＋imgdata=''でINSERT。getImage はファイル配信(無→404)。getInitialize で id>10000 画像掃除。
+- makePosts: per-post COUNT廃止→posts.comment_count列使用。コメント/ユーザを sqlx.In で一括取得（N+1排除）。postComment で comment_count++、dbInitialize で再集計。
+- フィードクエリ: getIndex/getPosts は `USE INDEX (idx_feed)` + comment_count列取得。
+- Post構造体 comment_count タグ済。テンプレは canonical(Ruby/PHP同一DOM)を不変で使用。
+- 検証: 全ページ200・画像配信OK・rendered=comment_count列=live COUNT 一致・コメント/新規投稿の即時可視OK・fail0。→大会ベンチで 1+2 の伸び計測待ち。次は Step3(sync.Map)/Step4(session・native hash)。
+### 第5R-3/4【sync.Map断片キャッシュ / session化 / ban集合 / native digest】Go移植。ローカルfail0(228k-232k, PHPローカル~195k超)。
+- **断片キャッシュ sync.Map**（Go最大の旨味・往復ゼロ）: post.html断片を `pf:{id}:c{count}` でプロセス内キャッシュ。csrfは `@@CSRFTOKEN@@` プレースホルダで全ユーザ共有→動的 ReplaceAll 合成。comment_count自動invalidate。
+  - posts.html を `{{ template "post.html" . }}`→`{{ .Rendered }}` に（whitespace不変＝出力同一）。buildListPosts が鍵をindex-only取得→断片ミス分だけ本体/コメント/ユーザfetch。
+- **getSessionUser キャッシュ化**: userCache(sync.Map id→User)。毎回の SELECT users を排除（初回のみDB）。
+- **ban集合 sync.Map**: del_flg=1 ID集合をメモリ保持。フィード選別の SELECT users IN を排除。
+- **digest native化**: openssl exec → crypto/sha512（バイト互換確認済）。escapeshellarg/os/exec 撤去。
+- 無効化: /initialize と postAdminBanned で clearAppCaches()/ban再ロード。comment/post は key変化で自動切替。
+- ★画像書き込みをアトミック化(temp+rename): 配信側が書込途中の部分ファイルを読む race を解消（fail2→fail0）。
+- 検証: 全ページ200・rendered=live一致・csrf合成(匿名空/ログイン実トークン)・コメント/新規投稿の即時可視・fail0安定(2回)。→大会ベンチで 392k 超えを検証。超えれば go-port を main へ merge。
+### 第5R-5【高並列対応: 接続/テンプレ設定の欠落を修正】Go。ローカルfail0(~275k, 前232k)。大会で392k超え検証。
+- 犯人1(接続churn): main()に `db.SetMaxOpenConns(64)/SetMaxIdleConns(64)/SetConnMaxLifetime(0)`。DSNに `interpolateParams=true`(prepare+exec→1往復)。MySQL接続を unix socket化(host=localhost時)。
+- nginx⇄Go keepalive: `upstream goapp { server 127.0.0.1:8080; keepalive 64; }` + `proxy_http_version 1.1` + `proxy_set_header Connection ""`。isucon.conf.go 更新。
+- MySQL my.cnf: `max_connections=512`, `thread_cache_size=100`（mysqld.cnf, 再起動耐性）。
+- 犯人2(テンプレ毎回パース): 全テンプレを cachedTmpl(sync.Map)で起動後1回だけParse。毎リクエストのディスクread/パースを排除。
+- 断片キャッシュ eviction: fragStore で件数上限(50000)超で全消去（無制限増加→GC劣化を防止）。
+- 検証: 全ページ200・fail0安定(2回, ~275k)・comment_count一致・即時可視維持。→大会ベンチで 392k 超え確認。超えれば go-port を main に merge。

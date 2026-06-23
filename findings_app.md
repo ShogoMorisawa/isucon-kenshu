@@ -275,3 +275,56 @@
   - **残り時間が少ない／確実性重視なら**、第4R-①②③（APCu化＋bootstrap削減＋ban集合）でPHPを詰める方が低リスク。これだけでも ~450-500k は狙える可能性。
   - 中間案: まず②(零リスク)と③をPHPで入れて確実に積み、並行してGoプロトタイプを別端末で検証→コンテストベンチで上回ったら切替。
 (5)根拠: 律速＝PHPインタプリタCPU。Goは「per-request bootstrap」「memcached往復」「フレームワーク生成」という第4Rで削ろうとしている固定費を**構造的に全部ゼロ化**する。方向は完全に正しいが、未最適化ベースラインからの再移植コストと可逆性をどう見るかの経営判断。要 MEMO（実装係の残時間/工数感）と突き合わせ。
+
+---
+
+# [17:0x Go分析] なぜGoが大会でPHPに負けるのか（PHP392k > Go278k、ローカルはGo228k>PHP195k）
+
+go-port の `webapp/golang/app.go` 全行＋templates を精読。**逆転の主因はほぼ1点に特定できた**。以下、効果(=伸びしろ)順。
+
+## 【主因・致命傷】テンプレートを毎リクエスト `template.ParseFiles` で再パースしている
+(1)現象: `getIndex`(640-666)・`getAccountName`・`getPosts`・`getPostsID`・`getLogin`等が**毎リクエスト**
+```
+template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(layout.html, index.html, posts.html, post.html)).Execute(...)
+```
+を実行。`ParseFiles` は **4ファイルをディスクから読み、Goテンプレートを毎回パース＆コンパイル**する。断片キャッシュ(`.Rendered`)があっても、それを差し込む**外側テンプレートのパースは毎回まるごと再実行**。しかも `posts.html` は `{{.Rendered}}` を出すだけ(確認済)なのに `post.html` まで毎回parse（実行すらされない無駄parse）。
+(2)なぜ致命的か＝**local→contest逆転の正体**:
+  - PHPは views を `require` するだけ＝**OPcacheがコンパイル済opcodeをキャッシュ**し、テンプレ「コンパイル」コストは実質ゼロに償却される。Goの`ParseFiles`は**どこにもキャッシュされず毎回パース**＝PHPに無くGoだけにある巨大な固定費。
+  - パースは**CPU重 + 大量アロケーション**(パースツリー生成)。→ リクエスト毎にGCゴミを量産。
+  - **ローカル**: benchmarkerが同居CPU67%を食い総RPSが頭打ち→このparse固定費が律速に達せず、Goのコンパイル速度/no-bootstrap優位が僅差で勝つ(228>195)。
+  - **大会**: benchmarker分離でアプリがCPU専有＋高RPS。**parse固定費とGCがRPSに比例して増大**し、ここが壁になる。PHPはOPcacheでparse≒0＋PHP-FPMはGC無し(リクエスト終了でメモリ一括解放)のため高負荷で素直にスケール。→ **高負荷ほどGoのparse/GC固定費が効いてPHPに抜かれる**。これが392k vs 278k(-29%)の最大要因。
+(3)推奨アクション: **テンプレートを起動時に1度だけパースして package変数 or `map[string]*template.Template` に保持**し、各ハンドラは `Execute` のみ呼ぶ。断片用 `postFragTmpl` が既に `sync.Once` でやっているのと同じ手法を全テンプレに展開するだけ。さらにcache-hit主体の `/`・`/posts` では `post.html` をparse対象から外す。
+(4)根拠: 最頻GETの毎回parse＋アロケを除去＝PHPがOPcacheで得ている償却をGoでも得る。**これ単体でlocalの優位が大会でも出る公算が高い**。最優先。
+
+## 【移植漏れ①】遅延セッションがGoに無い（PHPは匿名で session 往復をスキップ）
+(1)現象: PHPは「cookieがある時だけ session_start」で**匿名GETのmemcached往復とSet-Cookieを丸ごと省略**(第4R確定施策)。Goの `getSessionUser`→`getSession`→`store.Get`(gsm/memcache) は**常に実行**され、cookie付きリクエストでは毎回 memcached からセッションをロード。`getIndex` は getSessionUser/getCSRFToken/getFlash でsessionを参照（gorillaのリクエストレジストリで1リクエスト1ロードに集約はされるが、ロード自体は走る）。
+(2)原因仮説: PHPで効いた「匿名はsession触らない」最適化がGo未移植。大会は認証済主体とはいえ、匿名/初回や静的近傍でも一律にセッション機構を起動している分の固定費差。
+(3)推奨アクション: cookie(`isuconp-go.session`)が無いリクエストでは `store.Get` を呼ばず空Userで通す薄いガードを入れる。書込経路(login/register/comment/post)はそのまま。
+(4)根拠: PHPに有ってGoに無い固定費を埋める。主因(テンプレ)ほどではないが移植漏れの穴。
+
+## 【移植漏れ②/Go特有】インメモリキャッシュが無制限増加（TTL/eviction無し）→ 長時間走行でGC劣化
+(1)現象: `fragmentCache`/`userCache` は `sync.Map` で **TTLもeviction も無い**。`pf:{id}:c{count}` はコメントが付くたび `comment_count` が変わり**新キーが増え続け、旧キーは永久に残る**(`clearAppCaches` は /initialize 時のみ)。大会の高コメント負荷では1投稿が c0,c1,c2... と多数の死蔵エントリを生む。
+(2)原因仮説: PHP版は memcached(TTL600 + LRU eviction)で古い断片を自動破棄。Goの sync.Map は**捨てない**ため、ベンチ進行とともにマップが肥大→**GCが全エントリを走査するコストが時間とともに増加**＝走行後半でスループット低下。sync.Map は高頻度Storeで内部dirty昇格コストも高い。「ヒット率」自体はsync.Map(プロセス内共有)で問題ないが、**肥大によるGC圧**が差を生む。
+(3)推奨アクション: (a)断片キャッシュにサイズ上限＋LRU/世代破棄を入れる（または同一post_idの旧comment_countキーをコメント時にdelete）。(b)少なくとも `comment` 投稿時に該当 `pf:{post_id}:c{old}` を削除し死蔵を防ぐ。(c)`GOGC` 調整(例: 200〜)でGC頻度を下げるのも有効(infra)。
+(4)根拠: contestの長時間・高write下でGoだけ進行劣化する典型。PHPはeviction有りで劣化しない。逆転を助長する第2要因の候補。
+
+## 【Go特有の非効率】csrf合成 `strings.ReplaceAll` を断片ごとに実行（全ヒットでもアロケーション）
+(1)現象: `buildListPosts`(305, 368) は**投稿1件ごと**に `strings.ReplaceAll(fragment, "@@CSRFTOKEN@@", csrf)` を実行＝20件で20回のフルスキャン＋20個の新規文字列アロケーション。**全ヒット時でも毎リクエスト発生**。PHP版は結合後の `$html` 全体に対し `str_replace` を**1回**(第4R, index.php:356)。
+(2)原因仮説: Goは断片ごと置換でアロケーションがPHPの20倍。GCゴミ増。「無視できるか」への答えは**高RPSでは無視できない**(主因テンプレより小だが積算)。
+(3)推奨アクション: 断片を連結してから1回 `ReplaceAll`、もしくは csrf を `@@CSRFTOKEN@@` 文字列置換でなく **テンプレ側のフィールド**として後段layoutテンプレで描画（断片には出さない）。最善は「断片からcsrf入力を外し、ページ末尾の hidden input でcsrfを1回だけ出す」設計。
+(4)根拠: アロケーション/GC削減。主因対策後の積み増しとして効く。
+
+## 【副次】その他のGo側の穴（優先度中〜低）
+- `getPostsID`(813) は `SELECT *`＝imgdata列(現在は空''だが列取得は発生)を引く。PHP高速パスはカラム限定。`SELECT id,user_id,body,mime,created_at,comment_count` に限定推奨。
+- `getPostsID` 詳細ページは**断片キャッシュ無し**で毎回 makePosts＋全テンプレparse。`POST /comment` 後に必ず叩かれる経路なので、テンプレ事前パース(主因対策)が特に効く。将来は `pd:{id}:c{count}` 断片化も。
+- `getImage` フォールバック(962) は `os.ReadFile`→`w.Write` で全読込。`http.ServeFile`/`ServeContent` なら sendfile + 自動 Last-Modified/Range/304。ただし通常はnginx直配信なので影響小。
+- GOMAXPROCS/`GOGC` などランタイム調整は infra係領域。CPU専有環境ではGC設定が効く。
+
+## 結論（実装係向け・大会で逆転を取り返す順）
+1. **テンプレートを起動時1回パースして使い回す（最優先・主因）**。これで local の Go優位が大会でも出る公算大。
+2. **インメモリキャッシュのeviction/上限＋GOGC**（長時間走行のGC劣化を止める）。
+3. **遅延セッション移植**（匿名のsession往復スキップ）。
+4. **csrf置換を1回化 or テンプレフィールド化**（アロケ削減）。
+5. 副次: getPostsID の SELECT * 限定、詳細ページのテンプレ事前パース、getImageのServeFile。
+
+要点: **「ローカルで速いのに大会で負ける」＝高RPS・長時間でしか露呈しない固定費(=毎回テンプレparse)とGC劣化(=無制限キャッシュ)が犯人**。PHPはOPcache(parse償却)＋FPMのGC無し＋memcached eviction で高負荷に強い。Goでも 1.テンプレ事前パース と 2.キャッシュeviction を入れれば、構造的優位(no-bootstrap/in-process cache)が大会スコアに反映されるはず。要 findings_infra.md（GOGC/GOMAXPROCS）・findings_db.md（idx_feed が covering か）と突き合わせ。

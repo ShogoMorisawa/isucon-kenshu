@@ -236,6 +236,37 @@ function image_url($post) {
     return "/image/{$post['id']}{$ext}";
 }
 
+// アプリ用 memcached（セッションとは別の永続接続）。フィード/詳細キャッシュに使用。
+function feed_cache() {
+    static $mc = null;
+    if ($mc === null) {
+        $mc = new Memcached('feedpool');
+        if (!count($mc->getServerList())) {
+            $mc->addServer('127.0.0.1', 11211);
+        }
+    }
+    return $mc;
+}
+
+// フィードのグローバルバージョン。投稿/コメント追加で bump し、古いキャッシュキーを参照させない。
+function feed_version() {
+    $mc = feed_cache();
+    $v = $mc->get('feed_version');
+    if ($v === false) {
+        $mc->add('feed_version', 1);
+        $v = $mc->get('feed_version');
+        $v = ($v === false) ? 1 : $v;
+    }
+    return $v;
+}
+function bump_feed_version() {
+    $mc = feed_cache();
+    if ($mc->increment('feed_version', 1) === false) {
+        $mc->add('feed_version', 1);
+        $mc->increment('feed_version', 1);
+    }
+}
+
 function validate_user($account_name, $password) {
     if (!(preg_match('/\A[0-9a-zA-Z_]{3,}\z/', $account_name) && preg_match('/\A[0-9a-zA-Z_]{6,}\z/', $password))) {
         return false;
@@ -262,6 +293,8 @@ function calculate_passhash($account_name, $password) {
 
 $app->get('/initialize', function (Request $request, Response $response) {
     $this->get('helper')->db_initialize();
+    // DBリセットに伴い、古いフィード/詳細キャッシュを全消去（initializeは最初に呼ばれ、保持すべきセッションは無い）
+    feed_cache()->flush();
     // db_initialize は posts id>10000 を削除する。対応する画像ファイルもここで掃除し
     // ベンチ毎のアップロード画像がディスクに累積してフルになるのを防ぐ。
     $imgdir = dirname(__DIR__) . '/public/image';
@@ -363,12 +396,20 @@ $app->get('/logout', function (Request $request, Response $response) {
 $app->get('/', function (Request $request, Response $response) {
     $me = $this->get('helper')->get_session_user();
 
-    $db = $this->get('db');
-    // idx_created_at の逆順読みでfilesort回避。del_flg除外はmake_posts内。母数をLIMITで制限(削除ユーザ~2%なので100で20件は確実)
-    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 100');
-    $ps->execute();
-    $results = $ps->fetchAll(PDO::FETCH_ASSOC);
-    $posts = $this->get('helper')->make_posts($results);
+    // フィード($posts)は全ユーザ共通。memcachedにキャッシュし、投稿/コメント時のfeed_versionバンプで無効化。
+    // me/csrf/flash はキャッシュ外でテンプレ合成するのでユーザ別表示は保たれる。
+    $mc = feed_cache();
+    $ckey = 'index:v' . feed_version();
+    $posts = $mc->get($ckey);
+    if ($posts === false) {
+        $db = $this->get('db');
+        // idx_created_at の逆順読みでfilesort回避。del_flg除外はmake_posts内。母数をLIMITで制限(削除ユーザ~2%なので100で20件は確実)
+        $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 100');
+        $ps->execute();
+        $results = $ps->fetchAll(PDO::FETCH_ASSOC);
+        $posts = $this->get('helper')->make_posts($results);
+        $mc->set($ckey, $posts, 10);
+    }
 
     return $this->get('view')->render($response, 'index.php', [
         'posts' => $posts,
@@ -459,6 +500,8 @@ $app->post('/', function (Request $request, Response $response) {
             $imgdir = dirname(__DIR__) . '/public/image';
             file_put_contents("{$imgdir}/{$pid}.{$ext}", $data);
         }
+        // 新規投稿はフィード先頭に出る → キャッシュ無効化
+        bump_feed_version();
         return redirect($response, "/posts/{$pid}", 302);
     } else {
         $this->get('flash')->addMessage('notice', '画像が必須です');
@@ -510,6 +553,9 @@ $app->post('/comment', function (Request $request, Response $response) {
         $me['id'],
         $params['comment']
     ]);
+
+    // コメント追加でフィードのコメント数/最新3件が変わる → キャッシュ無効化
+    bump_feed_version();
 
     return redirect($response, "/posts/{$post_id}", 302);
 });

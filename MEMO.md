@@ -25,6 +25,8 @@
 | 2026-06-23 13:18 | 166597 / 167404 (pass, fail0/2回) | 【性能2】画像 `Cache-Control: public, max-age=31536000, immutable`、Cache-Control重複(public/max-age 2本)を解消。score変動内(既存1d max-ageで既にテスト窓全体キャッシュ済のため伸びず)。重複ヘッダ修正＋immutableは意味的に正しく零リスクのため採用 |
 | 2026-06-23 13:25 | **181596 / 182627** (pass, fail0/2回) | 【性能3a】server に `gzip off`（HTML非圧縮）。loopbackで圧縮の帯域メリット無し、nginx圧縮CPU+bench解凍CPU(計測bench60%)の二重浪費を排除。~170k→~182k(**+7%, 変動超で確実**)。採用 |
 | 2026-06-23 13:35 | 175733 / 178834 (fail0) | 【性能3b・不採用】php-fpm max_children 16→8。~182k→~177kで一貫して低下（I/O待ちがあり16の方がコア稼働率高い。context-switch懸念は顕在化せず）。**16へ revert**。4はさらに悪化見込みで未試行 |
+| 2026-06-23 13:4x | 177621 / 177387 (fail0) | 【性能4 stage1・不採用】GET /posts/{id} を memcached データ構造キャッシュ(post:{id}, コメント時delete)。**fail0で整合機構は実証**したが ~182k→~177k(-2.7%)。当該endpointは元々indexクエリで安価＋memcached往復+unserializeが相殺。revert(機構はstage2へ流用) |
+| 2026-06-23 13:5x | **192630 / 191257** (pass, **fail0**/2回) | 【性能4 stage2】GET / フィード($posts)を memcached キャッシュ。`index:v{feed_version}` キー。POST / と POST /comment で feed_version を increment し即時無効化。me/csrf/flash はキャッシュ外合成。/initialize で flush。~182k→~192k(**+5.5%, 変動超**)。**投稿/コメント即時反映 fail0 確認**。採用 |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。
@@ -39,6 +41,12 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 13:5x 【性能4】GET / フィードキャッシュ（index.php, memcached）。score ~182k→~192k(+5.5%, fail0)。
+  - `feed_cache()`=アプリ用Memcached永続接続(127.0.0.1:11211, persistent_id=feedpool)。`feed_version()`/`bump_feed_version()`=increment整数。
+  - GET /: `$posts` を `index:v{feed_version}` でキャッシュ(TTL10s)。me/csrf/flashはキャッシュ外でテンプレ合成しユーザ別表示維持。
+  - 無効化: `POST /`(新規投稿) と `POST /comment`(コメント) で `bump_feed_version()`。→ 次GET /は新keyで再構築し**投稿/コメント即時反映**(ベンチfail0)。
+  - `/initialize` で `feed_cache()->flush()`（DBリセットと同時に古いキャッシュ全消去。最初の呼出で保持すべきセッション無し）。
+  - ※GET /posts/{id} のデータ構造キャッシュは stage1 で -2.7% のため不採用（元々安価なクエリ）。
 - 2026-06-23 13:25 【性能3a】HTML gzip無効化（isucon.conf, server に `gzip off;`）。score ~170k→~182k(+7%)。
   - loopbackベンチでは圧縮の帯域利益が無く、nginx圧縮+benchmarker解凍が同2コアを二重に食う純損失だった（計測でbench=60%CPU）。
   - 注: `gzip off` を location ~ \.php に置くと try_files内部redirectで効かず、server直下に置く必要があった。css/js/svgも非圧縮になるが小容量・低頻度で影響軽微。nginx.conf側の `gzip on`/gzip_types は残置（このserverでoff上書き）。

@@ -246,3 +246,61 @@
 - 台数が使えるなら: **まず【2台=DB分離】で確実に+20〜30%**（app boxにコア集中）。**さらに台数があれば【app水平スケール】で500k超が射程**。鍵は「memcached集約」と「画像ファイル共有」の整合設計（ここを誤るとfail）。
 - 台数が1台に固定なら: 残る現実的な弾は **①unix socket化（未適用・要大会A/B）** と **②worker数の大会環境再チューニング** のみ。あとはPHP実行量削減=app/db係の領域（断片キャッシュ拡張・テンプレ実行回避）に戻る。
 - ⚠️測定規律: ローカルbenchはbench自身が67%CPUを食い数%差を覆い隠す。**①②および複数台効果は必ず大会ベンチ（bench別マシン）で、同方向・複数回・変動±2.5%超で判定**すること。
+
+---
+# ===== Go分析（大会: PHP 392,566 > Go 278,809 / ローカル: Go 228k > PHP 195k の逆転）=====
+
+## 結論（先に）
+逆転の主因は**言語の速さでも最適化差でもなく、Go側の「接続まわりが高並列で破綻する」構造欠陥**。Go実装はDB接続プール無設定＋nginx⇄Goにkeepalive無し。**ローカルは低並列なので欠陥が眠り、大会は高並列で欠陥が爆発**する。PHPの pm=static=16＋永続接続は「高並列で自動的に接続数を絞って再利用する」ため大会でこそ強い。
+
+## 計測した事実（2026-06-23, nginx→Go:8080, isu-go active）
+- **app.go: `sqlx.Open("mysql",dsn)` のみ。`SetMaxOpenConns`/`SetMaxIdleConns`/`SetConnMaxLifetime` が一切無い**
+  → Goデフォルト = **MaxIdleConns=2 / MaxOpenConns=無制限 / lifetime=無制限**。
+- **nginx→Go: `proxy_pass http://127.0.0.1:8080` のみ。`upstream{keepalive}`・`proxy_http_version 1.1`・`proxy_set_header Connection ""` が無い**
+  → nginxは**HTTP/1.0でupstream接続し毎リクエストTCPを張り直す**（keepaliveされない）。
+- MySQL GLOBAL STATUS に**接続チャーンの痕跡**: `Connections=110743`(累積接続試行が膨大) / `Threads_created=1105`(thread_cache_size=9に対し過大＝スレッド生成の繰り返し) / `Max_used_connections=28`(PHPなら~16で頭打ちのはず) / Aborted_connects=0。
+- GOMAXPROCS: env未設定 → 既定で `runtime.NumCPU()=2`。**2コアには適正**（ここは問題でない）。
+- Go実装は**十分に最適化済み**（L94 comment_count非正規化バックフィル, L222 sync.Mapユーザキャッシュ, 断片キャッシュ, L317/330 posts/comments の IN 一括取得）。→ **「Goが素のリファレンスで最適化負け」説は否定**。
+
+## ★逆転の構造的メカニズム（最重要）
+**ローカル（bench同居・CPU希少・低並列）**
+- benchが約67%CPUを奪う＝**bench自身が高並列を生成できない**（リクエスト生成goroutineがCPU飢餓）。app到達の同時実行数は低い。
+- 低並列ではGoはidle接続2本でほぼ足り、接続チャーンは起きない。CPUが唯一の希少資源なので、**1リクエストの素のCPUが軽いGoが勝つ** → Go 228k > PHP 195k。
+
+**大会（bench別マシン・2コアフル・高並列）**
+- benchがフル同時接続を叩き込む。ここでGoの2欠陥が同時発火:
+  - **(A) DBプール: MaxIdleConns=2＋MaxOpenConns無制限** → 同時要求がidle2本を超えると**新規接続を次々open→使用後closeで捨てる**（idleに戻せない）。MySQLのスレッド生成/認証/破棄が暴走し、**mysqld CPUとapp側sys CPUを食う＋取得待ちでレイテンシ増**。`Max_used_connections=28`/`Threads_created=1105`がこの挙動の裏付け。最悪 max_connections=151 に迫り 1040 リスク。
+  - **(B) nginx⇄Go keepalive無し** → 高RPSで**毎リクエストloopback TCPを張り直し**、sys CPU＋TIME_WAIT積み上げ。
+- 結果: **大会で増えたCPUをGoは「接続管理(sys)と待ち」に浪費し、有用処理(usr)に変換できない**。CPUを使い切れず頭打ち → Go 278k。
+- 一方PHP: `pm=static=16`＋`PDO ATTR_PERSISTENT` = **常に16本の温かい接続を再利用**。同時実行は16で自然に頭打ち（=組込みの admission control）。高並列でもチャーンゼロ・接続枯渇ゼロ。**PHPの「硬い」プロセスモデルが高並列でこそ美点**になり 392k。
+
+→ 要約: **「Goは並列度不足」ではなく「並列度が無制限すぎて下流(DB接続)を破綻させ、backpressureが無い」**。PHPは構造的に並列を絞り接続を再利用するので大会の高並列に強い。ローカルは並列が低くこの差が出ないため逆転して見える。
+
+## 推奨アクション（実装係向け・効果順。コードは実装係が変更）
+1. **【最優先・ほぼ確実】Go の DB接続プールを明示設定**（app.go の sqlx.Open 直後）:
+   - `db.SetMaxOpenConns(N)` … Nは「有用な同時実行数」に合わせ**有界化**（2コアなら目安 24〜64 で大会A/B。max_connections=151内）。
+   - `db.SetMaxIdleConns(N)` … **MaxOpenConnsと同値**にして接続を**捨てずに再利用**（チャーン停止の肝。デフォルト2が諸悪の根源）。
+   - `db.SetConnMaxLifetime(0 or 数分)`。
+   - 併せて MySQL `max_connections` を 256〜512 へ引上げ（Nを大きく試す場合の安全弁）、`thread_cache_size` を 64程度へ。
+   - 期待: 大会高並列でmysqldのスレッド生成/認証CPUとapp側待ちが消え、CPUがusr(有用処理)へ回る。**逆転の最大要因の解消**。
+2. **【高・低リスク】nginx⇄Go を keepalive 化**:
+   - `upstream goapp { server 127.0.0.1:8080; keepalive 64; }` ＋ location で `proxy_pass http://goapp; proxy_http_version 1.1; proxy_set_header Connection "";`
+   - 毎リクエストのloopback TCP張り直しを排除。高RPSのsys CPUとTIME_WAITを削減。
+3. **【中】Go側に同時実行の上限（backpressure）を持たせる**: PHPの max_children=16 に相当する仕組みがGoに無い。(1)のMaxOpenConnsがDB側の事実上のリミッタになるが、加えてハンドラ前段にセマフォ（buffered channel）で同時処理数を制限すると、過負荷時の暴走（ゴルーチン爆発・メモリ/スケジューラ圧）を防げる。まず(1)で十分な可能性大、伸び悩めば検討。
+4. GOMAXPROCS は2のままで適正（変更不要）。`GOGC` を 200 程度に上げGCのCPUを減らす微調整は大会A/Bの余地（優先度低）。
+
+## 検証方法（大会 or bench別マシン環境で。ローカルは低並列で再現しないため判定不可）
+- ベンチ中に app server で:
+  ```
+  mpstat -P ALL 1 10     # %usr vs %sys vs %idle。Goで%sysが高い/idleが残るなら接続チャーン律速の証拠
+  pidstat -u 1 10 | awk '/app|mysqld|nginx/{a[$NF]+=$8}END{for(k in a)print k,a[k]"%"}'
+  # MySQL接続チャーンの増分（30秒で取り差分を見る）
+  mysql -e "SHOW GLOBAL STATUS LIKE 'Threads_created'; SHOW GLOBAL STATUS LIKE 'Connections'; SHOW STATUS LIKE 'Threads_running';"
+  ss -tan state time-wait | wc -l   # TIME_WAIT のloopback積み上げ（keepalive無しの裏付け）
+  ```
+- 判定: (1)適用後に **Threads_created の増加が止まり、Max_used_connections が設定上限近くで安定、%sys低下・%usr上昇** すれば原因確定＆解消。
+- 期待される結末: プール+keepalive修正後のGoは、低CPU/リクエストの本来の強みを大会の高並列でも発揮し、**PHP(392k)を上回る可能性が高い**。現状の278kは「Goが遅い」のではなく「設定欠落で大会並列に対応できていない」だけ。
+
+## どちらに賭けるかの示唆
+- **Goを採るなら (1)(2) は必須**。これ無しのGoは大会で不利。修正は数行＋nginx数行で低リスク・高期待値。
+- ただしPHPは既に392kで安定実績。**「Goプール修正→大会A/Bで392k超を確認できたら切替、未達ならPHP継続」**が安全。さらに前述の**複数台構成は言語非依存**で、どちらを採っても効くので並行検討推奨。

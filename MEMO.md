@@ -237,3 +237,10 @@ cd /home/isucon/private_isu/benchmarker
 - 無効化: /initialize と postAdminBanned で clearAppCaches()/ban再ロード。comment/post は key変化で自動切替。
 - ★画像書き込みをアトミック化(temp+rename): 配信側が書込途中の部分ファイルを読む race を解消（fail2→fail0）。
 - 検証: 全ページ200・rendered=live一致・csrf合成(匿名空/ログイン実トークン)・コメント/新規投稿の即時可視・fail0安定(2回)。→大会ベンチで 392k 超えを検証。超えれば go-port を main へ merge。
+### 第5R-5【高並列対応: 接続/テンプレ設定の欠落を修正】Go。ローカルfail0(~275k, 前232k)。大会で392k超え検証。
+- 犯人1(接続churn): main()に `db.SetMaxOpenConns(64)/SetMaxIdleConns(64)/SetConnMaxLifetime(0)`。DSNに `interpolateParams=true`(prepare+exec→1往復)。MySQL接続を unix socket化(host=localhost時)。
+- nginx⇄Go keepalive: `upstream goapp { server 127.0.0.1:8080; keepalive 64; }` + `proxy_http_version 1.1` + `proxy_set_header Connection ""`。isucon.conf.go 更新。
+- MySQL my.cnf: `max_connections=512`, `thread_cache_size=100`（mysqld.cnf, 再起動耐性）。
+- 犯人2(テンプレ毎回パース): 全テンプレを cachedTmpl(sync.Map)で起動後1回だけParse。毎リクエストのディスクread/パースを排除。
+- 断片キャッシュ eviction: fragStore で件数上限(50000)超で全消去（無制限増加→GC劣化を防止）。
+- 検証: 全ページ200・fail0安定(2回, ~275k)・comment_count一致・即時可視維持。→大会ベンチで 392k 超え確認。超えれば go-port を main に merge。

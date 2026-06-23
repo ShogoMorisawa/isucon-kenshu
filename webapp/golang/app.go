@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -184,8 +185,23 @@ var (
 	postFragOnce  sync.Once
 )
 
+// 断片キャッシュは comment_count キーで自動invalidateするが、コメント毎に旧キーが残り増え続ける。
+// 件数上限で全消去し、無制限増加→GC全走査によるスループット劣化を防ぐ（消去後はオンデマンド再生成）。
+const fragCacheLimit = 50000
+
+var fragCount atomic.Int64
+
+func fragStore(key, val string) {
+	fragmentCache.Store(key, val)
+	if fragCount.Add(1) >= fragCacheLimit {
+		fragmentCache.Clear()
+		fragCount.Store(0)
+	}
+}
+
 func clearAppCaches() {
 	fragmentCache.Clear()
+	fragCount.Store(0)
 	userCache.Clear()
 	bannedMu.Lock()
 	bannedSet = nil
@@ -364,7 +380,7 @@ func buildListPosts(ctx context.Context, rows []Post, csrf string) ([]Post, erro
 			p.Comments = comments
 			p.CSRFToken = csrfPlaceholder
 			frag := renderFragment(p)
-			fragmentCache.Store(keys[i], frag)
+			fragStore(keys[i], frag)
 			out[i] = Post{ID: p.ID, Rendered: template.HTML(strings.ReplaceAll(frag, csrfPlaceholder, csrf))}
 		}
 	}
@@ -490,6 +506,21 @@ func getTemplPath(filename string) string {
 	return path.Join("templates", filename)
 }
 
+// パース済みテンプレートをプロセス内にキャッシュ（毎リクエストの ParseFiles を排除）。
+// テンプレートは parse 後 read-only で並行 Execute 安全。
+var tmplCache sync.Map
+
+func cachedTmpl(key string, build func() *template.Template) *template.Template {
+	if v, ok := tmplCache.Load(key); ok {
+		return v.(*template.Template)
+	}
+	t := build()
+	actual, _ := tmplCache.LoadOrStore(key, t)
+	return actual.(*template.Template)
+}
+
+var tmplFuncs = template.FuncMap{"imageURL": imageURL}
+
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dbInitialize(ctx)
@@ -520,10 +551,9 @@ func getLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("login.html")),
-	).Execute(w, struct {
+	cachedTmpl("login", func() *template.Template {
+		return template.Must(template.ParseFiles(getTemplPath("layout.html"), getTemplPath("login.html")))
+	}).Execute(w, struct {
 		Me    User
 		Flash string
 	}{me, getFlash(w, r, "notice")})
@@ -560,10 +590,9 @@ func getRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("register.html")),
-	).Execute(w, struct {
+	cachedTmpl("register", func() *template.Template {
+		return template.Must(template.ParseFiles(getTemplPath("layout.html"), getTemplPath("register.html")))
+	}).Execute(w, struct {
 		Me    User
 		Flash string
 	}{User{}, getFlash(w, r, "notice")})
@@ -649,16 +678,14 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("index.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	cachedTmpl("index", func() *template.Template {
+		return template.Must(template.New("layout.html").Funcs(tmplFuncs).ParseFiles(
+			getTemplPath("layout.html"),
+			getTemplPath("index.html"),
+			getTemplPath("posts.html"),
+			getTemplPath("post.html"),
+		))
+	}).Execute(w, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
@@ -734,16 +761,14 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("user.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	cachedTmpl("user", func() *template.Template {
+		return template.Must(template.New("layout.html").Funcs(tmplFuncs).ParseFiles(
+			getTemplPath("layout.html"),
+			getTemplPath("user.html"),
+			getTemplPath("posts.html"),
+			getTemplPath("post.html"),
+		))
+	}).Execute(w, struct {
 		Posts          []Post
 		User           User
 		PostCount      int
@@ -790,14 +815,12 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, posts)
+	cachedTmpl("posts", func() *template.Template {
+		return template.Must(template.New("posts.html").Funcs(tmplFuncs).ParseFiles(
+			getTemplPath("posts.html"),
+			getTemplPath("post.html"),
+		))
+	}).Execute(w, posts)
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
@@ -831,15 +854,13 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("post_id.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	cachedTmpl("postid", func() *template.Template {
+		return template.Must(template.New("layout.html").Funcs(tmplFuncs).ParseFiles(
+			getTemplPath("layout.html"),
+			getTemplPath("post_id.html"),
+			getTemplPath("post.html"),
+		))
+	}).Execute(w, struct {
 		Post Post
 		Me   User
 	}{p, me})
@@ -1023,10 +1044,9 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("banned.html")),
-	).Execute(w, struct {
+	cachedTmpl("banned", func() *template.Template {
+		return template.Must(template.ParseFiles(getTemplPath("layout.html"), getTemplPath("banned.html")))
+	}).Execute(w, struct {
 		Users     []User
 		Me        User
 		CSRFToken string
@@ -1098,11 +1118,19 @@ func main() {
 	cfg := mysql.NewConfig()
 	cfg.User = user
 	cfg.Passwd = password
-	cfg.Net = "tcp"
-	cfg.Addr = fmt.Sprintf("%s:%s", host, port)
+	// 同一ホスト(localhost)なら unix socket でTCPハンドシェイクを省く。別ホスト指定時はTCP（複数台構成用）。
+	if host == "" || host == "localhost" || host == "127.0.0.1" {
+		cfg.Net = "unix"
+		cfg.Addr = "/var/run/mysqld/mysqld.sock"
+	} else {
+		cfg.Net = "tcp"
+		cfg.Addr = fmt.Sprintf("%s:%s", host, port)
+	}
 	cfg.DBName = dbname
 	cfg.Params = map[string]string{
 		"charset": "utf8mb4",
+		// prepare+exec の2往復を1往復にする（クライアント側でパラメータ補間）
+		"interpolateParams": "true",
 	}
 	cfg.ParseTime = true
 	cfg.Loc = time.Local
@@ -1113,6 +1141,11 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
+
+	// 高並列向けコネクションプール（無設定だと MaxIdleConns=2 で接続churnが発生）
+	db.SetMaxOpenConns(64)
+	db.SetMaxIdleConns(64)
+	db.SetConnMaxLifetime(0)
 
 	r := chi.NewRouter()
 

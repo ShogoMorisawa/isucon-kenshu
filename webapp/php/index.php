@@ -404,7 +404,7 @@ $app->get('/', function (Request $request, Response $response) {
     if ($posts === false) {
         $db = $this->get('db');
         // idx_created_at の逆順読みでfilesort回避。del_flg除外はmake_posts内。母数をLIMITで制限(削除ユーザ~2%なので100で20件は確実)
-        $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 100');
+        $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 40');
         $ps->execute();
         $results = $ps->fetchAll(PDO::FETCH_ASSOC);
         $posts = $this->get('helper')->make_posts($results);
@@ -423,7 +423,7 @@ $app->get('/posts', function (Request $request, Response $response) {
     $max_created_at = $params['max_created_at'] ?? null;
     // ※/posts キャッシュは低頻度＋max_created_at別でヒット率低く効果無し(stage計測で~188k<192k)のため未キャッシュ
     $db = $this->get('db');
-    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 100');
+    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40');
     $ps->execute([$max_created_at === null ? null : $max_created_at]);
     $results = $ps->fetchAll(PDO::FETCH_ASSOC);
     $posts = $this->get('helper')->make_posts($results);

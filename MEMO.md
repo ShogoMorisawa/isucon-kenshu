@@ -27,6 +27,7 @@
 | 2026-06-23 13:35 | 175733 / 178834 (fail0) | 【性能3b・不採用】php-fpm max_children 16→8。~182k→~177kで一貫して低下（I/O待ちがあり16の方がコア稼働率高い。context-switch懸念は顕在化せず）。**16へ revert**。4はさらに悪化見込みで未試行 |
 | 2026-06-23 13:4x | 177621 / 177387 (fail0) | 【性能4 stage1・不採用】GET /posts/{id} を memcached データ構造キャッシュ(post:{id}, コメント時delete)。**fail0で整合機構は実証**したが ~182k→~177k(-2.7%)。当該endpointは元々indexクエリで安価＋memcached往復+unserializeが相殺。revert(機構はstage2へ流用) |
 | 2026-06-23 13:5x | **192630 / 191257** (pass, **fail0**/2回) | 【性能4 stage2】GET / フィード($posts)を memcached キャッシュ。`index:v{feed_version}` キー。POST / と POST /comment で feed_version を increment し即時無効化。me/csrf/flash はキャッシュ外合成。/initialize で flush。~182k→~192k(**+5.5%, 変動超**)。**投稿/コメント即時反映 fail0 確認**。採用 |
+| 2026-06-23 14:0x | **194567 / 196684** (pass, fail0/2回) | 【性能6】index母数 LIMIT 100→40（/ と /posts）。~192k→~195.6k(+1.9%,小だが両走とも上回る)。cache-miss再構築と/postsの行処理が軽量化。無リスクで採用 |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。
@@ -41,6 +42,7 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
+- 2026-06-23 14:0x 【性能6】index母数 LIMIT 100→40（/ と /posts, index.php）。score ~192k→~195.6k。削除ユーザ~2%なので40で20件確実。
 - 2026-06-23 13:5x 【性能4】GET / フィードキャッシュ（index.php, memcached）。score ~182k→~192k(+5.5%, fail0)。
   - `feed_cache()`=アプリ用Memcached永続接続(127.0.0.1:11211, persistent_id=feedpool)。`feed_version()`/`bump_feed_version()`=increment整数。
   - GET /: `$posts` を `index:v{feed_version}` でキャッシュ(TTL10s)。me/csrf/flashはキャッシュ外でテンプレ合成しユーザ別表示維持。

@@ -244,7 +244,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     if ($fast_path === '/') {
         $helper = $container->get('helper');
         $me = $helper->get_session_user();
-        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 40');
+        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `comment_count` FROM `posts` USE INDEX (idx_feed) ORDER BY `created_at` DESC LIMIT 40');
         $ps->execute();
         $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
         $post_list_html = build_list_html($helper, $rows);
@@ -272,7 +272,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         // GET /posts ページング。※Slim経路は 'me' を渡さない＝ヘッダは常にログインリンク。$me を定義しないことで一致。
         $helper = $container->get('helper');
         $max_created_at = $_GET['max_created_at'] ?? null;
-        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40');
+        $ps = $helper->db()->prepare('SELECT `id`, `user_id`, `comment_count` FROM `posts` USE INDEX (idx_feed) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40');
         $ps->execute([$max_created_at === null ? null : $max_created_at]);
         $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
         $post_list_html = build_list_html($helper, $rows);
@@ -286,7 +286,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         $user = $helper->fetch_first('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0', $account_name);
         if ($user !== false) {
             $db = $helper->db();
-            $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `created_at`, `mime`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC');
+            $ps = $db->prepare('SELECT `id`, `user_id`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC');
             $ps->execute([$user['id']]);
             $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
             $post_list_html = build_list_html($helper, $rows);
@@ -397,6 +397,9 @@ function render_one_post_fragment(array $post) {
 // 断片キーは (post_id, comment_count)。comment_count(非正規化列)はクエリで取得済なので、
 // **断片がヒットすればコメントを一切fetchしない**。コメント追加で comment_count が変わり自動invalidate。
 // csrf はプレースホルダで描画し最後に実トークンへ合成（断片を全ユーザで共有）。
+// $rows は軽量行（id, user_id, comment_count のみで可。body/mime/created_at はミス時にだけ取得）。
+// これにより断片ヒット率の高い通常時、フィードは index-only クエリ(idx_feed)だけで完結し
+// 40件ぶんの TEXT body を毎回 materialize する無駄を撲滅する。
 function build_list_html($helper, array $rows) {
     // 断片キャッシュは APCu(プロセス共有メモリ)。memcachedのTCP往復を排し getは数µs。単一サーバなので一貫性問題なし。
     // 選別はキャッシュ済みban集合で行い、毎回の SELECT users IN を排除する。
@@ -424,24 +427,34 @@ function build_list_html($helper, array $rows) {
         $found = [];
     }
 
-    // ヒットしなかった投稿だけ、コメント(最新3件)＋必要なユーザ(著者・コメント主)をまとめて取得。
-    // 全ヒット時は users/comments のDB往復が一切走らない。
-    $miss = [];
+    // ヒットしなかった投稿だけ、本体(body/mime/created_at)＋コメント(最新3件)＋必要ユーザをまとめて取得。
+    // 全ヒット時は posts本体/users/comments のDB往復が一切走らない（鍵クエリの index-only のみ）。
+    $miss_ids = [];
     foreach ($selected as $p) {
         if (!isset($found[$keys[$p['id']]])) {
-            $miss[] = $p;
+            $miss_ids[] = $p['id'];
         }
     }
     $user_cache = [];
     $comments_by_post = [];
-    if ($miss) {
-        $miss_ids = array_map(fn($p) => $p['id'], $miss);
+    $full_by_id = [];
+    if ($miss_ids) {
         $ph = implode(',', array_fill(0, count($miss_ids), '?'));
+        // 本体（断片描画に必要なフルカラム）
+        $ps = $helper->db()->prepare("SELECT `id`,`user_id`,`body`,`mime`,`created_at`,`comment_count` FROM `posts` WHERE `id` IN ({$ph})");
+        $ps->execute($miss_ids);
+        foreach ($ps->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $full_by_id[$r['id']] = $r;
+        }
+        // コメント
         $ps = $helper->db()->prepare("SELECT `id`,`post_id`,`user_id`,`comment`,`created_at` FROM `comments` WHERE `post_id` IN ({$ph}) ORDER BY `created_at` DESC");
         $ps->execute($miss_ids);
         $all = $ps->fetchAll(PDO::FETCH_ASSOC);
         // 必要ユーザ = ミス投稿の著者 + そのコメント主
-        $uids = array_map(fn($p) => $p['user_id'], $miss);
+        $uids = [];
+        foreach ($full_by_id as $r) {
+            $uids[] = $r['user_id'];
+        }
         foreach ($all as $c) {
             $uids[] = $c['user_id'];
         }
@@ -463,9 +476,10 @@ function build_list_html($helper, array $rows) {
             $html .= $found[$k];
             continue;
         }
-        $p['user'] = $user_cache[$p['user_id']] ?? null;
-        $p['comments'] = array_reverse($comments_by_post[$p['id']] ?? []);
-        $frag = render_one_post_fragment($p);
+        $post = $full_by_id[$p['id']]; // ミス時に取得したフル行
+        $post['user'] = $user_cache[$post['user_id']] ?? null;
+        $post['comments'] = array_reverse($comments_by_post[$p['id']] ?? []);
+        $frag = render_one_post_fragment($post);
         $to_set[$k] = $frag;
         $html .= $frag;
     }
@@ -614,7 +628,7 @@ $app->get('/', function (Request $request, Response $response) {
     // comment_count(非正規化列)込みで posts を取得 → build_list_html が断片ヒット時はコメントをfetchしない。
     // 新規投稿/コメントはこのクエリ結果(created_at順 / comment_count)に即反映されるので version不要・即時可視。
     $db = $this->get('db');
-    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 40');
+    $ps = $db->prepare('SELECT `id`, `user_id`, `comment_count` FROM `posts` USE INDEX (idx_feed) ORDER BY `created_at` DESC LIMIT 40');
     $ps->execute();
     $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
     $list_html = build_list_html($this->get('helper'), $rows);
@@ -630,7 +644,7 @@ $app->get('/posts', function (Request $request, Response $response) {
     $params = $request->getQueryParams();
     $max_created_at = $params['max_created_at'] ?? null;
     $db = $this->get('db');
-    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` FORCE INDEX (idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40');
+    $ps = $db->prepare('SELECT `id`, `user_id`, `comment_count` FROM `posts` USE INDEX (idx_feed) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 40');
     $ps->execute([$max_created_at === null ? null : $max_created_at]);
     $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
     $list_html = build_list_html($this->get('helper'), $rows);
@@ -829,7 +843,7 @@ $app->get('/@{account_name}', function (Request $request, Response $response, $a
         return $response->withStatus(404);
     }
 
-    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `created_at`, `mime`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC');
+    $ps = $db->prepare('SELECT `id`, `user_id`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC');
     $ps->execute([$user['id']]);
     $rows = $ps->fetchAll(PDO::FETCH_ASSOC);
     $list_html = build_list_html($this->get('helper'), $rows);

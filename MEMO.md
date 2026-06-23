@@ -43,7 +43,14 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
-- 2026-06-23 16:4x 【第4R-8(系A3)】build_list_html の users IN を ban集合キャッシュで撤廃（index.php）。大会ベンチ待ち。
+- 2026-06-23 17:0x 【第4R-9(系A4)】フィード covering index ＋ GET / 2段化（DB + index.php）。大会ベンチ待ち。
+  - DB: `ALTER TABLE posts ADD INDEX idx_feed (created_at, comment_count, user_id);`（leafにPK id 含む＝鍵に必要な id/user_id/comment_count が index-only で揃う）。
+    不要になった `idx_created_at` は DROP（書き込みコスト削減）。※サーバ/DB再構築時はこのDDL再適用が必要。
+  - GET / ・/posts の鍵クエリを `SELECT id, user_id, comment_count FROM posts USE INDEX (idx_feed) ...` に変更＝**index-only(Using index, Backward index scan, テーブル無アクセス)**。/@user も軽量化。
+  - `build_list_html` を「軽量行(id,user_id,comment_count)入力」に改修。**断片ミスした投稿だけ** `SELECT ...body... WHERE id IN(miss)` で本体取得＋コメント＋ユーザ取得。
+    → 断片ヒット率の高い通常時、毎GET/の「40件PK lookup＋TEXT body materialize」が消え、index-only 40件＋ミス分のみに。mysqld/php-fpm 両方のCPUを削減。
+  - 検証: GET / ・/posts が旧版とバイト一致、/@user・コメント即時反映・新規投稿可視 正常。EXPLAIN で鍵クエリ index-only 確認。
+- 2026-06-23 16:4x 【第4R-8(系A3)】build_list_html の users IN を ban集合キャッシュで撤廃（index.php）。大会 348,797 から計測待ち。
   - `banned_user_ids()`: del_flg=1 のid集合を APCu キャッシュ。フィード選別を「著者がban集合に無い投稿を上位20件」に変更し、毎回の `SELECT users IN(~21)` を排除。
   - 断片ミス時のみ、ミス投稿の著者＋コメント主を preload_users で取得。**全ヒット時は users/comments のDB往復が一切走らない**。
   - invalidate: `/initialize`(apcu_clear_cache) と `POST /admin/banned`(apcu_delete 'banned_uids')。register は del_flg=0 で無関係。

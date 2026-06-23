@@ -398,12 +398,13 @@ $app->get('/', function (Request $request, Response $response) {
 
     // フィード($posts)は全ユーザ共通。memcachedにキャッシュし、投稿/コメント時のfeed_versionバンプで無効化。
     // me/csrf/flash はキャッシュ外でテンプレ合成するのでユーザ別表示は保たれる。
+    // ※匿名フルHTMLキャッシュも試したが効果無し(GET /は大半が認証済トラフィックでanon cacheがヒットしない)→不採用。
     $mc = feed_cache();
     $ckey = 'index:v' . feed_version();
     $posts = $mc->get($ckey);
     if ($posts === false) {
         $db = $this->get('db');
-        // idx_created_at の逆順読みでfilesort回避。del_flg除外はmake_posts内。母数をLIMITで制限(削除ユーザ~2%なので100で20件は確実)
+        // idx_created_at の逆順読みでfilesort回避。del_flg除外はmake_posts内。母数をLIMITで制限(削除ユーザ~2%なので40で20件は確実)
         $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 40');
         $ps->execute();
         $results = $ps->fetchAll(PDO::FETCH_ASSOC);

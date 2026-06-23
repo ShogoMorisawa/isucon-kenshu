@@ -28,6 +28,7 @@
 | 2026-06-23 13:4x | 177621 / 177387 (fail0) | 【性能4 stage1・不採用】GET /posts/{id} を memcached データ構造キャッシュ(post:{id}, コメント時delete)。**fail0で整合機構は実証**したが ~182k→~177k(-2.7%)。当該endpointは元々indexクエリで安価＋memcached往復+unserializeが相殺。revert(機構はstage2へ流用) |
 | 2026-06-23 13:5x | **192630 / 191257** (pass, **fail0**/2回) | 【性能4 stage2】GET / フィード($posts)を memcached キャッシュ。`index:v{feed_version}` キー。POST / と POST /comment で feed_version を increment し即時無効化。me/csrf/flash はキャッシュ外合成。/initialize で flush。~182k→~192k(**+5.5%, 変動超**)。**投稿/コメント即時反映 fail0 確認**。採用 |
 | 2026-06-23 14:0x | **194567 / 196684** (pass, fail0/2回) | 【性能6】index母数 LIMIT 100→40（/ と /posts）。~192k→~195.6k(+1.9%,小だが両走とも上回る)。cache-miss再構築と/postsの行処理が軽量化。無リスクで採用 |
+| 2026-06-23 14:1x | 195555 / 190841 (fail0) | 【追加検証・不採用】匿名GET / のフルHTMLキャッシュ。~195.6k比 変動内で伸びず→GET /は大半が認証済トラフィックでanon cacheがヒットせず。revert。CPU再実測でphp-fpm80%/mysqld29%を確認(下記)。**性能5(comment_count非正規化=DB施策)はmysqld非律速のためskip** |
 
 > 初期ベンチの fail10 は GET /logout, GET /posts, POST /login, POST /register のタイムアウト。
 > 原因候補: php-fpm `pm.max_children=5` が小さく並列不足の可能性（インフラ調査係に確認依頼）。
@@ -129,6 +130,12 @@ cd /home/isucon/private_isu/benchmarker
 
 ## 📥 調査係からの提案 採否
 - findings_db.md / findings_app.md / findings_infra.md を参照し、採用したものをここに記録
+
+## 🔬 CPU再実測（性能4/6適用後, 2026-06-23 13:52）
+- 依然CPU飽和(idle~0.2%)。プロセス別: **php-fpm=80.6%(↑69→81, 最大の壁)** / benchmarker=67.3% / **mysqld=28.9%(↓39→29, キャッシュ/sessionでDB負荷減)** / nginx=19.8%。
+- **重要転換: 律速は完全に php-fpm(PHP実行=フレームワーク+テンプレ描画)。mysqld はもう壁でない。**
+  → 【性能5 comment_count非正規化(=DB施策)は的外れになった】mysqld 29%を削っても頭打ちは破れない。skip。
+  → 次の的は「PHPの実行量削減」: GET / の**HTMLレンダリング自体をキャッシュ**(テンプレ実行回避)＝匿名フルページキャッシュ等。
 
 ## 🔬 CPU実測（第3R step0, 2026-06-23 13:09, ベンチRUNNING中 mpstat/pidstat）
 - **2コアCPUは完全飽和: %idle ≈ 0.06%**（usr~76% + sys~21%）。CPUが唯一の壁。CPU節約=即スループット増。

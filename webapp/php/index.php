@@ -311,7 +311,7 @@ $app->get('/', function (Request $request, Response $response) {
 
     $db = $this->get('db');
     // idx_created_at の逆順読みでfilesort回避。del_flg除外はmake_posts内。母数をLIMITで制限(削除ユーザ~2%なので100で20件は確実)
-    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT 100');
+    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) ORDER BY `created_at` DESC LIMIT 100');
     $ps->execute();
     $results = $ps->fetchAll(PDO::FETCH_ASSOC);
     $posts = $this->get('helper')->make_posts($results);
@@ -327,7 +327,7 @@ $app->get('/posts', function (Request $request, Response $response) {
     $params = $request->getQueryParams();
     $max_created_at = $params['max_created_at'] ?? null;
     $db = $this->get('db');
-    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 100');
+    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` FORCE INDEX (idx_created_at) WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 100');
     $ps->execute([$max_created_at === null ? null : $max_created_at]);
     $results = $ps->fetchAll(PDO::FETCH_ASSOC);
     $posts = $this->get('helper')->make_posts($results);
@@ -381,26 +381,29 @@ $app->post('/', function (Request $request, Response $response) {
             return redirect($response, '/', 302);
         }
 
-        if (strlen(file_get_contents($_FILES['file']['tmp_name'])) > UPLOAD_LIMIT) {
+        // tmpは1回だけ読む
+        $data = file_get_contents($_FILES['file']['tmp_name']);
+        if (strlen($data) > UPLOAD_LIMIT) {
             $this->get('flash')->addMessage('notice', 'ファイルサイズが大きすぎます');
             return redirect($response, '/', 302);
         }
 
         $db = $this->get('db');
+        // imgdataはDBに保存しない（ファイル配信のみ）。imgdataはNOT NULLなので空文字を入れる
         $query = 'INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)';
         $ps = $db->prepare($query);
         $ps->execute([
           $me['id'],
           $mime,
-          file_get_contents($_FILES['file']['tmp_name']),
+          '',
           $params['body'],
         ]);
         $pid = $db->lastInsertId();
-        // 画像を静的ファイルへ書き出し（nginx直配信用）
+        // 画像を静的ファイルへ書き出し（nginx直配信用・GET /image はこのファイルに依存）
         $ext = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/gif' => 'gif'][$mime] ?? '';
         if ($ext !== '') {
             $imgdir = dirname(__DIR__) . '/public/image';
-            @file_put_contents("{$imgdir}/{$pid}.{$ext}", file_get_contents($_FILES['file']['tmp_name']));
+            file_put_contents("{$imgdir}/{$pid}.{$ext}", $data);
         }
         return redirect($response, "/posts/{$pid}", 302);
     } else {
@@ -414,16 +417,14 @@ $app->get('/image/{id}.{ext}', function (Request $request, Response $response, $
         return $response;
     }
 
-    $post = $this->get('helper')->fetch_first('SELECT `mime`, `imgdata` FROM `posts` WHERE `id` = ?', $args['id']);
-
-    if (($args['ext'] == 'jpg' && $post['mime'] == 'image/jpeg') ||
-        ($args['ext'] == 'png' && $post['mime'] == 'image/png') ||
-        ($args['ext'] == 'gif' && $post['mime'] == 'image/gif')) {
-        // フォールバック: ファイルが無ければ書き出して次回以降 nginx 直配信
-        $imgdir = dirname(__DIR__) . '/public/image';
-        @file_put_contents("{$imgdir}/{$args['id']}.{$args['ext']}", $post['imgdata']);
-        $response->getBody()->write($post['imgdata']);
-        return $response->withHeader('Content-Type', $post['mime']);
+    // 画像はファイル配信のみ（imgdataはDBに保持しない）。通常はnginxが直配信し、ここに来るのはファイル未存在時。
+    // 念のためファイルが在ればPHPからも返す（nginxのnegativeキャッシュ対策）。無ければ404。
+    $imgdir = dirname(__DIR__) . '/public/image';
+    $path = "{$imgdir}/{$args['id']}.{$args['ext']}";
+    $mime = ['jpg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif'][$args['ext']] ?? '';
+    if ($mime !== '' && is_file($path)) {
+        $response->getBody()->write(file_get_contents($path));
+        return $response->withHeader('Content-Type', $mime);
     }
     $response->getBody()->write('404');
     return $response->withStatus(404);

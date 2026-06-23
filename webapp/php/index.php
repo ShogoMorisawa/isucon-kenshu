@@ -382,7 +382,7 @@ function render_one_post_fragment(array $post) {
 // **断片がヒットすればコメントを一切fetchしない**。コメント追加で comment_count が変わり自動invalidate。
 // csrf はプレースホルダで描画し最後に実トークンへ合成（断片を全ユーザで共有）。
 function build_list_html($helper, array $rows) {
-    $mc = feed_cache();
+    // 断片キャッシュは APCu(プロセス共有メモリ)。memcachedのTCP往復を排し getは数µs。単一サーバなので一貫性問題なし。
     // del_flg=0 の投稿を最大 POSTS_PER_PAGE 件選ぶ（user は一括取得）
     $user_cache = [];
     $helper->preload_users(array_map(fn($p) => $p['user_id'], $rows), $user_cache);
@@ -406,8 +406,8 @@ function build_list_html($helper, array $rows) {
     foreach ($selected as $p) {
         $keys[$p['id']] = 'pf:' . (int)$p['id'] . ':c' . (int)($p['comment_count'] ?? 0);
     }
-    $found = $mc->getMulti(array_values($keys));
-    if ($found === false) {
+    $found = apcu_fetch(array_values($keys));
+    if (!is_array($found)) {
         $found = [];
     }
 
@@ -448,7 +448,7 @@ function build_list_html($helper, array $rows) {
         $html .= $frag;
     }
     if ($to_set) {
-        $mc->setMulti($to_set, 600);
+        apcu_store($to_set, null, 600);
     }
     return str_replace(CSRF_PLACEHOLDER, escape_html($_SESSION['csrf_token'] ?? ''), $html);
 }
@@ -479,7 +479,9 @@ function calculate_passhash($account_name, $password) {
 
 $app->get('/initialize', function (Request $request, Response $response) {
     $this->get('helper')->db_initialize();
-    // DBリセットに伴い、古いフィード/詳細キャッシュを全消去（initializeは最初に呼ばれ、保持すべきセッションは無い）
+    // DBリセットに伴い、古いキャッシュを全消去（initializeは最初に呼ばれ、保持すべきセッションは無い）。
+    // 断片キャッシュは APCu、セッションは memcached なので両方クリア。
+    apcu_clear_cache();
     feed_cache()->flush();
     // db_initialize は posts id>10000 を削除する。対応する画像ファイルもここで掃除し
     // ベンチ毎のアップロード画像がディスクに累積してフルになるのを防ぐ。

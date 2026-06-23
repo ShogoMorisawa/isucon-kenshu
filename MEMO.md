@@ -43,7 +43,12 @@ cd /home/isucon/private_isu/benchmarker
 - ベンチ前に上の信号機を RUNNING、後に IDLE へ戻すこと。
 
 ## ✅ 確定した変更（適用済み）
-- 2026-06-23 16:0x 【第4R-5】Slimバイパス横展開（index.php, 高速パスdispatcher）。endpoint毎に別commit。大会ベンチ待ち。
+- 2026-06-23 16:3x 【第4R-7(系A2)】断片キャッシュ memcached→**APCu**（index.php + システム依存）。大会ベンチ待ち。
+  - `build_list_html` の getMulti/setMulti を `apcu_fetch`/`apcu_store($arr,null,600)` へ。最ホットGET /のmemcached TCP往復(21キー)をプロセス共有メモリ(数µs)に置換。
+  - `/initialize` で `apcu_clear_cache()`（＋セッション用memcachedは feed_cache()->flush() 継続）。キー体系 `pf:{id}:c{count}`・TTL600・comment_count自動invalidate は不変。
+  - ⚠️**システム依存**: `php8.3-apcu` 導入済、`/etc/php/8.3/mods-available/apcu.ini` に `apc.shm_size=128M`。サーバ再構築時は要再導入。要 `systemctl restart php8.3-fpm`。
+- 2026-06-23 16:1x 【第4R-6(系A1)】高速パスを AppFactory::create() 前へ移動（index.php）。Slim App/Router/Middleware生成を高速パス該当リクエストで完全回避。出力バイト一致維持。大会ベンチ待ち。
+- 2026-06-23 16:0x 【第4R-5】Slimバイパス横展開（index.php, 高速パスdispatcher）。endpoint毎に別commit。大会 348,797 から計測待ち。
   - dispatcher: `parse_url(REQUEST_URI,PATH)` で分岐。該当しない/404は exit せず Slim へフォールスルー（404応答を共通化）。
   - 5a `GET /posts/{id}`(06b19be): 投稿詳細。存在時のみ高速、未存在はフォールスルー。anon/li バイト一致。
   - 5b `GET /posts`(7f34a66): ページング。Slim経路同様 `me` を渡さない(ヘッダ常にログインリンク)。バイト一致＋paging確認。
